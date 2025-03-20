@@ -22,3 +22,6 @@ pip uninstall deepspeed -y
 pip install deepspeed==0.15.4
 pip install gdown
 pip install -e .
+
+git config --global user.email "nganngants@gmail.com"
+git config --global user.name "nganngants"

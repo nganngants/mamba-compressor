@@ -27,6 +27,7 @@ class MambaCompressor(nn.Module):
             f"Loaded Mamba model from {mamba_path} "
             f"with hidden size {self.mamba.config.hidden_size} and "
             f"memory projection to size {llm_input_size}"
+            f"Memory token ID: {mem_token_id}"
         )
 
     def forward(self, input_ids):

@@ -78,12 +78,12 @@ def prepare_input(
         padding=True,
         truncation=True,
         return_tensors='pt',
-        max_length=512
+        max_length=max_length
     ).to(device)
 
     logger.info(f"input_ids: {input_ids}")  
 
-    memory_features = mamba_model(input_ids).to(torch.float16)
+    memory_features = mamba_model(input_ids["input_ids"]).to(torch.float16)
     atts_memory = torch.ones(
             (memory_features.size(0), memory_features.size(1)),
             dtype=torch.long,
