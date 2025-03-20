@@ -46,16 +46,16 @@ class MambaCompressor(nn.Module):
         4. Projects features to target LLM dimension
         """
         # Get hidden states from Mamba model
-        outputs = self.mamba(input_ids).last_hidden_state  # Shape: (batch_size, seq_len, hidden_size)
-        
-        # Create mask identifying memory token positions
+        outputs = self.mamba(input_ids).last_hidden_state
+     
         mem_token_mask = input_ids == self.mem_token_id
-        # Get coordinates of memory tokens as (batch_idx, seq_idx) pairs
+       
+        batch_indices = torch.arange(outputs.size(0), device=outputs.device)[:, None]
         mem_positions = mem_token_mask.nonzero()
-        batch_nums = mem_positions[:, 0]  # Batch indices for each memory token
-        seq_positions = mem_positions[:, 1]  # Sequence positions of memory tokens
+        batch_nums = mem_positions[:, 0]
+        seq_positions = mem_positions[:, 1]
         
-        # Extract features at memory token positions for each batch item
+        # Group memory features by batch
         memory_features = []
         for batch_idx in range(outputs.size(0)):
             batch_mask = batch_nums == batch_idx
@@ -63,9 +63,13 @@ class MambaCompressor(nn.Module):
             batch_features = outputs[batch_idx, batch_positions]
             memory_features.append(batch_features)
         
-        # Stack batch features and project to target dimension
         memory_features = torch.stack(memory_features)
-        return self.memory_projection(memory_features)
+        # print(f'Memory features: {memory_features.shape}')
+
+        outputs = self.memory_projection(memory_features)
+        # print(f'Final outputs: {outputs.shape}')
+        
+        return outputs
 
     def save_pretrained(self, path: str):
         os.makedirs(path, exist_ok=True)
@@ -112,17 +116,17 @@ class LLMConfig:
    use_double_quant: bool = True
 
 def load_llm_and_tokenizer(config: LLMConfig):
-#    quantization_config = BitsAndBytesConfig(
-#        load_in_4bit=config.load_in_4bit,
-#        bnb_4bit_compute_dtype=config.compute_dtype,
-#        bnb_4bit_quant_type=config.quant_type,
-#        bnb_4bit_use_double_quant=config.use_double_quant
-#    )
+   quantization_config = BitsAndBytesConfig(
+       load_in_4bit=config.load_in_4bit,
+       bnb_4bit_compute_dtype=config.compute_dtype,
+       bnb_4bit_quant_type=config.quant_type,
+       bnb_4bit_use_double_quant=config.use_double_quant
+   )
 
    model = AutoModelForCausalLM.from_pretrained(
        config.llm_name,
        device_map=config.device,
-    #    quantization_config=quantization_config
+       quantization_config=quantization_config
    )
 
    tokenizer = AutoTokenizer.from_pretrained(config.llm_name, add_bos_token=True)

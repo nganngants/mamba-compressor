@@ -1,7 +1,7 @@
 import argparse
 import logging
 from pathlib import Path
-from transformers import AutoModelForCausalLM, AutoTokenizer, MambaModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, MambaModel, BitsAndBytesConfig
 import torch
 import torch.nn as nn
 from typing import Dict, Optional
@@ -12,9 +12,11 @@ from data import (
     prepare_single_utterances_data, 
     prepare_multiple_utterances_data
 )
-from model import MambaCompressor, load_llm_and_tokenizer
+from model import MambaCompressor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class TrainingConfig:
@@ -60,6 +62,10 @@ def train_epoch(model: MambaCompressor,
             device=config.device,
             end_sym=config.end_sym
         )
+        
+        logger.info(f"input embeds: {input_data['input_embeds'].shape}")
+        logger.info(f"attention mask: {input_data['attention_mask'].shape}")
+        logger.info(f"labels: {input_data['labels'].shape}")
         
         llm_outputs = llm(
             inputs_embeds=input_data['input_embeds'],
@@ -182,6 +188,37 @@ def setup_logging(log_dir: Path):
             logging.StreamHandler()
         ]
     )
+
+def load_llm_and_tokenizer(config: TrainingConfig):
+    """Load LLM and tokenizer with proper quantization settings"""
+    quantization_config = None
+    if config.load_in_4bit:
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=getattr(torch, config.compute_dtype),
+            bnb_4bit_quant_type=config.quant_type,
+            bnb_4bit_use_double_quant=config.use_double_quant,
+        )
+    
+    tokenizer = AutoTokenizer.from_pretrained(config.llm_name, add_bos_token=True)
+    if not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # add <MEM> token to tokenizer
+    tokenizer.add_special_tokens({'additional_special_tokens': ['<MEM>']})
+        
+    model = AutoModelForCausalLM.from_pretrained(
+        config.llm_name,
+        device_map=config.device,
+        quantization_config=quantization_config,
+        torch_dtype=getattr(torch, config.compute_dtype)
+    )
+    
+    # Move model to device explicitly if not using device_map
+    if not config.load_in_4bit and config.device != "auto":
+        model = model.to(config.device)
+        
+    return model, tokenizer
 
 def main():
     parser = argparse.ArgumentParser()
