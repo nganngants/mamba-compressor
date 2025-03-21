@@ -12,8 +12,8 @@ python model/train.py \
     --epochs_conv 2 \
     --lr_single 2.5e-5 \
     --lr_conv 1e-4 \
-    --device cuda
+    --device cuda \
     --load_in_4bit \
-    --compute_dtype bfloat16 \
+    --compute_dtype float16 \
     --quant_type nf4 \
     --use_double_quant \
