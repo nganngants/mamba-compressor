@@ -8,6 +8,7 @@ from transformers import (
     MambaModel,
     BitsAndBytesConfig,
     AutoModelForCausalLM,
+    AutoModelForVision2Seq,
     AutoTokenizer
 )
 
@@ -51,7 +52,7 @@ class MambaCompressor(nn.Module):
         4. Projects features to target LLM dimension
         """
         # Get hidden states from Mamba model
-        outputs = self.mamba(**input_ids).last_hidden_state
+        outputs = self.mamba(input_ids['input_ids'].to(self.device)).last_hidden_state
 
         mem_token_mask = input_ids['input_ids'] == self.mem_token_id
        
@@ -69,10 +70,8 @@ class MambaCompressor(nn.Module):
             memory_features.append(batch_features)
         
         memory_features = torch.stack(memory_features)
-        # print(f'Memory features: {memory_features.shape}')
 
         outputs = self.memory_projection(memory_features)
-        # print(f'Final outputs: {outputs.shape}')
         
         return outputs
 
@@ -119,22 +118,3 @@ class LLMConfig:
    compute_dtype: torch.dtype = torch.float16
    quant_type: str = "nf4"
    use_double_quant: bool = True
-
-def load_llm_and_tokenizer(config: LLMConfig):
-   quantization_config = BitsAndBytesConfig(
-       load_in_4bit=config.load_in_4bit,
-       bnb_4bit_compute_dtype=config.compute_dtype,
-       bnb_4bit_quant_type=config.quant_type,
-       bnb_4bit_use_double_quant=config.use_double_quant
-   )
-
-   model = AutoModelForCausalLM.from_pretrained(
-       config.llm_name,
-       device_map=config.device,
-       quantization_config=quantization_config
-   )
-
-   tokenizer = AutoTokenizer.from_pretrained(config.llm_name, add_bos_token=True)
-   tokenizer.add_special_tokens({'additional_special_tokens': ['<MEM>']})
-   
-   return model, tokenizer

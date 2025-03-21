@@ -1,20 +1,33 @@
 import argparse
 import logging
 from pathlib import Path
-from transformers import AutoModelForCausalLM, AutoTokenizer, MambaModel, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, MambaModel, BitsAndBytesConfig, AutoModelForVision2Seq
 import torch
 import torch.nn as nn
 from typing import Dict, Optional
 from dataclasses import dataclass
 from data import (
     ConversationDataset, 
-    prepare_input,
     prepare_single_utterances_data, 
     prepare_multiple_utterances_data
 )
+from vllm import LLM, SamplingParams
+
+from typing import List
 from model import MambaCompressor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
+os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"  # Try disabling cuDNN v8 API
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # For better error reporting
+
+# After imports, add these PyTorch settings
+torch.backends.cudnn.enabled = False
+torch.backends.cudnn.benchmark = False
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +52,76 @@ class TrainingConfig:
     quant_type: str = "nf4"
     use_double_quant: bool = False
 
+def prepare_input(
+    mamba_model,
+    llm_model: AutoModelForCausalLM,
+    llm_tokenizer: AutoTokenizer,
+    system_prompt: str,
+    input_texts: List[str],
+    device: str = 'cuda',
+    end_sym: str = '\n'
+):
+    # print(f'Input texts: {input_texts}')
+    # Get Mamba memory features
+    input_ids = llm_tokenizer(
+        input_texts,
+        padding=True,
+        truncation=True,
+        return_tensors='pt',
+        max_length=512
+    ).to(device)
+
+    memory_features = mamba_model(input_ids).to(torch.float16)
+    atts_memory = torch.ones(
+        (memory_features.size(0), memory_features.size(1)),
+        dtype=torch.long,
+    ).to(device)
+    
+    # Combine system prompt with memory features
+    system_encodings = llm_tokenizer(
+        [system_prompt] * len(input_texts),
+        padding=True,
+        truncation=True,
+        return_tensors='pt',
+        max_length=64
+    ).to(device)
+    system_embeds = llm_model.model.embed_tokens(system_encodings['input_ids']) # (batch, seq, hidden)
+    # print(f'System encodings: {system_embeds.shape}')
+    # print(f'Memory features: {memory_features.shape}')
+    
+    memory_features = torch.cat([system_embeds, memory_features], dim=1)
+    atts_memory = atts_memory[:, :1].expand(-1, memory_features.size(1))
+
+    # Prepare target texts
+    target_texts = [t + end_sym for t in input_texts]
+    to_regress_tokens = llm_tokenizer(
+        target_texts,
+        truncation=True,
+        return_tensors="pt",
+        padding="longest",
+        max_length=512,
+    ).to(device)
+    targets = to_regress_tokens.input_ids.masked_fill(
+                to_regress_tokens.input_ids == llm_tokenizer.pad_token_id, -100
+            )
+    empty_targets = (
+                torch.ones([memory_features.shape[0], memory_features.shape[1]],
+                        dtype=torch.long).to(device).fill_(-100)
+            )
+    targets = torch.cat([empty_targets, targets], dim=1)
+
+    batch_size = memory_features.shape[0]
+
+    to_regress_embeds = llm_model.model.embed_tokens(to_regress_tokens.input_ids)
+    input_embeds = torch.cat([memory_features, to_regress_embeds], dim=1)
+    attention_mask = torch.cat([atts_memory, to_regress_tokens.attention_mask], dim=1)
+
+    return {
+        'input_embeds': input_embeds,
+        'attention_mask': attention_mask,
+        'labels': targets
+    }
+
 def train_epoch(model: MambaCompressor,
                 llm: AutoModelForCausalLM,
                 tokenizer: AutoTokenizer,
@@ -51,6 +134,10 @@ def train_epoch(model: MambaCompressor,
     total_loss = 0
     progress_bar = tqdm(train_loader)
     
+    # Disable cuDNN optimizations for debugging
+    torch.backends.cudnn.enabled = False  # Temporary test
+    torch.backends.cudnn.benchmark = False
+    
     for batch in progress_bar:
         optimizer.zero_grad()
         input_data = prepare_input(
@@ -61,18 +148,24 @@ def train_epoch(model: MambaCompressor,
             input_texts=batch['input_text'],
             device=config.device,
             end_sym=config.end_sym
-        ).to(config.device)
-        
-        logger.info(f"input embeds: {input_data['input_embeds'].shape}")
-        logger.info(f"attention mask: {input_data['attention_mask'].shape}")
-        logger.info(f"labels: {input_data['labels'].shape}")
-        
-        llm_outputs = llm(
-            inputs_embeds=input_data['input_embeds'],
-            attention_mask=input_data['attention_mask'],
-            labels=input_data['labels'],
-            return_dict=True
         )
+        
+        # Debug shapes
+        print(f"Batch size: {len(batch['input_text'])}")
+        print(f"Input embeds: {input_data['input_embeds'].shape}")
+        print(f"Attention mask: {input_data['attention_mask'].shape}")
+        print(f"Labels: {input_data['labels'].shape}")
+        
+        try:
+            llm_outputs = llm(
+                inputs_embeds=input_data['input_embeds'],
+                attention_mask=input_data['attention_mask'],
+                labels=input_data['labels'],
+                return_dict=True
+            )
+        except RuntimeError as e:
+            print(f"Error during forward pass: {e}")
+            break
         
         loss = llm_outputs.loss
         loss.backward()
@@ -85,6 +178,8 @@ def train_epoch(model: MambaCompressor,
         del input_data, llm_outputs
         torch.cuda.empty_cache()
         
+    # Re-enable cuDNN if needed
+    torch.backends.cudnn.enabled = True
     return total_loss / len(train_loader)
 
 def validate(model: MambaCompressor,
@@ -207,11 +302,17 @@ def load_llm_and_tokenizer(config: TrainingConfig):
     # add <MEM> token to tokenizer
     tokenizer.add_special_tokens({'additional_special_tokens': ['<MEM>']})
         
+    # model = LLM(config.llm_name, dtype=torch.bfloat16, trust_remote_code=True,
+    #         quantization="bitsandbytes", load_format="bitsandbytes")
+
+
     model = AutoModelForCausalLM.from_pretrained(
         config.llm_name,
         device_map=config.device,
         quantization_config=quantization_config,
-        torch_dtype=getattr(torch, config.compute_dtype)
+        torch_dtype=getattr(torch, config.compute_dtype),
+        trust_remote_code=True,
+        use_flash_attention_2=False
     )
     
     # Move model to device explicitly if not using device_map
@@ -243,6 +344,8 @@ def main():
     
     args = parser.parse_args()
     config = TrainingConfig(**vars(args))
+
+    logger.info(config)
     
     setup_logging(Path(config.model_dir))
     
@@ -265,4 +368,5 @@ def main():
     )
 
 if __name__ == "__main__":
+
     main()

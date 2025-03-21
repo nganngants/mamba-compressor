@@ -44,3 +44,4 @@ dependencies:
       - einops-exts==0.0.4
       - bitsandbytes==0.43.0
       - pytorchvideo
+      - gdown
