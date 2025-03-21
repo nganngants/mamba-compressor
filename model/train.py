@@ -61,7 +61,7 @@ def train_epoch(model: MambaCompressor,
             input_texts=batch['input_text'],
             device=config.device,
             end_sym=config.end_sym
-        )
+        ).to(config.device)
         
         logger.info(f"input embeds: {input_data['input_embeds'].shape}")
         logger.info(f"attention mask: {input_data['attention_mask'].shape}")

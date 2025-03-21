@@ -4,9 +4,13 @@ import os
 import json
 import torch
 import torch.nn as nn
-from transformers import MambaModel
-from transformers import BitsAndBytesConfig
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    MambaModel,
+    BitsAndBytesConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer
+)
+
 import logging
 logger = logging.getLogger(__name__)
 
@@ -47,9 +51,9 @@ class MambaCompressor(nn.Module):
         4. Projects features to target LLM dimension
         """
         # Get hidden states from Mamba model
-        outputs = self.mamba(input_ids).last_hidden_state
-     
-        mem_token_mask = input_ids == self.mem_token_id
+        outputs = self.mamba(**input_ids).last_hidden_state
+
+        mem_token_mask = input_ids['input_ids'] == self.mem_token_id
        
         batch_indices = torch.arange(outputs.size(0), device=outputs.device)[:, None]
         mem_positions = mem_token_mask.nonzero()
