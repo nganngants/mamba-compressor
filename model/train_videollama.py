@@ -12,6 +12,7 @@ from data import (
     prepare_multiple_utterances_data
 )
 # from vllm import LLM, SamplingParams
+from videollama2 import model_init
 
 from typing import List
 from model import MambaCompressor
@@ -151,10 +152,10 @@ def train_epoch(model: MambaCompressor,
         )
         
         # Debug shapes
-        print(f"Batch size: {len(batch['input_text'])}")
-        print(f"Input embeds: {input_data['input_embeds'].shape}")
-        print(f"Attention mask: {input_data['attention_mask'].shape}")
-        print(f"Labels: {input_data['labels'].shape}")
+        # print(f"Batch size: {len(batch['input_text'])}")
+        # print(f"Input embeds: {input_data['input_embeds']}")
+        # print(f"Attention mask: {input_data['attention_mask']}")
+        # print(f"Labels: {input_data['labels']}")
         
         try:
             llm_outputs = llm(
@@ -286,39 +287,54 @@ def setup_logging(log_dir: Path):
 
 def load_llm_and_tokenizer(config: TrainingConfig):
     """Load LLM and tokenizer with proper quantization settings"""
-    quantization_config = None
-    if config.load_in_4bit:
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=getattr(torch, config.compute_dtype),
-            bnb_4bit_quant_type=config.quant_type,
-            bnb_4bit_use_double_quant=config.use_double_quant,
-        )
+    # quantization_config = None
+    # if config.load_in_4bit:
+    #     quantization_config = BitsAndBytesConfig(
+    #         load_in_4bit=True,
+    #         bnb_4bit_compute_dtype=getattr(torch, config.compute_dtype),
+    #         bnb_4bit_quant_type=config.quant_type,
+    #         bnb_4bit_use_double_quant=config.use_double_quant,
+    #     )
     
-    tokenizer = AutoTokenizer.from_pretrained(config.llm_name, add_bos_token=True)
-    if not tokenizer.pad_token:
-        tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer = AutoTokenizer.from_pretrained(config.llm_name, add_bos_token=True)
+    # if not tokenizer.pad_token:
+    #     tokenizer.pad_token = tokenizer.eos_token
 
     # add <MEM> token to tokenizer
-    tokenizer.add_special_tokens({'additional_special_tokens': ['<MEM>']})
         
     # model = LLM(config.llm_name, dtype=torch.bfloat16, trust_remote_code=True,
     #         quantization="bitsandbytes", load_format="bitsandbytes")
 
 
-    model = AutoModelForCausalLM.from_pretrained(
-        config.llm_name,
-        device_map=config.device,
-        quantization_config=quantization_config,
-        torch_dtype=getattr(torch, config.compute_dtype),
-        trust_remote_code=True,
-        use_flash_attention_2=False
-    )
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     config.llm_name,
+    #     device_map=config.device,
+    #     quantization_config=quantization_config,
+    #     torch_dtype=getattr(torch, config.compute_dtype),
+    #     trust_remote_code=True,
+    #     use_flash_attention_2=False
+    # )
     
-    # Move model to device explicitly if not using device_map
-    if not config.load_in_4bit and config.device != "auto":
-        model = model.to(config.device)
-        
+    # # Move model to device explicitly if not using device_map
+    # if not config.load_in_4bit and config.device != "auto":
+    #     model = model.to(config.device)
+
+    model, _, tokenizer = model_init(config.llm_name)
+    tokenizer.add_special_tokens(
+        {'additional_special_tokens': 
+            [
+                '<|im_start|>', 
+                '<|im_end|>',
+                '<history>',
+                '<video>',
+                '<MEM>'
+            ]
+        }
+    )
+
+    for param in model.parameters():
+        param.requires_grad = False
+   
     return model, tokenizer
 
 def main():
