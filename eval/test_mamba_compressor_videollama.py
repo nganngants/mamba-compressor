@@ -12,7 +12,7 @@ import torch.nn as nn
 
 # Import the necessary modules
 from model import MambaCompressor
-from model.inputs import prepare_input
+from model import prepare_input
 from videollama2 import model_init
 
 # Configure logging
@@ -86,15 +86,11 @@ def run_test(
         }
     )
     
-    # Get memory token ID
-    mem_token_id = tokenizer.convert_tokens_to_ids('<MEM>')
-    
     logger.info(f"Loading MambaCompressor from: {mamba_model_path}")
     mamba_model = MambaCompressor.from_pretrained(
         path=mamba_model_path,
         device=device,
         tokenizer_len=len(tokenizer),
-        mem_token_id=mem_token_id
     ).to(device)
     
     # Set models to evaluation mode
@@ -157,12 +153,10 @@ def main():
     args = parser.parse_args()
     
     # Hardcoded test inputs
-    test_inputs = [
-        "The video shows a dog playing with a ball in a park. The dog is a golden retriever and the ball is blue.",
-        "In this video, a person is cooking pasta in a kitchen. They add salt to the boiling water before adding the pasta.",
-        "The video demonstrates how to change a car tire. First, the car is jacked up and then the lug nuts are removed.",
-        "A concert performance showing a rock band playing on stage with flashing lights and an excited audience.",
-        "The tutorial explains how to create a simple website using HTML and CSS. It starts with creating the basic structure."
+    test_inputs = ["""
+    user ( user Emotion : anger , user Expresstion : I mean, shit, don't you know that men are the new women? The speaker seems to be in a calm and relaxed state. She is sitting on a couch and looking at the camera with a smile on her face.The speaker's emotional expression in this picture could be due to a variety of reasons, including her personal life, relationships, or work-related stress. However, without further information, it is difficult to determine the specific cause of her emotional state. . Obsessed with weddings and children. The speaker seems to be in a state of contemplation or deep thought, as he is looking down and talking on the phone while sitting at a table.The speaker's emotional expression could be due to a personal or professional problem that he is trying to solve. . And lately he's lost touch with reality. The speaker seems to be in a calm and relaxed state, as she is sitting on a couch and talking to someone.The speaker's emotional expression in this picture could be a sign of sadness or depression, as she is sitting on a couch and talking to someone in a calm and relaxed state. . He he thinks I'm seeing someone. That's how this whole thing started. The speaker appears to be calm and relaxed throughout the video.The speaker's emotional expression could be due to a variety of reasons, such as stress, anxiety, or frustration. However, without more context, it is difficult to determine the specific cause of the speaker's emotional state. . It's unbelievable. The speaker appears to be in a state of contemplation, as he is sitting in a chair and looking down. He seems to be deep in thought, possibly pondering a difficult decision or problem.The speaker's emotional expression could be a sign of stress or frustration, as he is sitting in a chair and looking down. It is possible that he is dealing with a difficult situation or problem that is causing him to feel overwhelmed or upset.)  : I mean, shit, don't you know that men are the new women? Obsessed with weddings and children. And lately he's lost touch with reality. He he thinks I'm seeing someone. That's how this whole thing started. It's unbelievable. <MEM>  sys ( sys Emotion : neutral , sys Strategy : Restatement ) : But I thought you said it came out of nowhere. You were watching tv, then suddenly... <MEM> 
+    """
+    # "user ( user Emotion : anger ): I mean, shit, don't you know that men are the new women? Obsessed with weddings and children. And lately he's lost touch with reality. He he thinks I'm seeing someone. That's how this whole thing started. It's unbelievable. <MEM>"
     ]
     
     # System prompt
