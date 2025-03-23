@@ -14,7 +14,8 @@ from tqdm import tqdm
 from data import ConversationDataset, prepare_single_utterances_data, prepare_multiple_utterances_data
 from model import MambaCompressor
 from model.inputs import prepare_input
-
+import json 
+from .mamba_compressor import setup_deepspeed_model
 
 @dataclass
 class TrainingConfig:
@@ -23,7 +24,7 @@ class TrainingConfig:
     valid_data: str
     model_dir: str
     llm_name: str
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda"
     batch_size_single: int = 8
     batch_size_conv: int = 1
     epochs_single: int = 3
@@ -69,6 +70,7 @@ class TrainingConfig:
     bf16: bool = False
     pipeline_parallel_size: int = 1
     tensor_parallel_size: int = 1
+    amp: bool = False
 
 
 class EarlyStopping:
@@ -130,7 +132,7 @@ def mixup_data(input_embeds, labels, alpha=1.0, device='cuda'):
         lam = 1
     
     batch_size = input_embeds.size(0)
-    index = torch.randperm(batch_size).to(device)
+    index = torch.randperm(batch_size)
     
     mixed_input_embeds = lam * input_embeds + (1 - lam) * input_embeds[index, :]
     return mixed_input_embeds, labels, labels[index], lam
@@ -166,23 +168,30 @@ def train_epoch(model,
     
     for i, batch in enumerate(progress_bar):
         try:
+            logging.info(f'{i}')
+            logging.info(f'device: {actual_mamba_model.device}')
             input_data = prepare_input(
                 mamba_model=actual_mamba_model,
                 llm_model=llm,
                 llm_tokenizer=tokenizer,
                 system_prompt=system_prompt,
                 input_texts=batch['input_text'],
-                device=config.device,
+                device='cuda',
                 end_sym=config.end_sym
             )
             
+            logging.info('check devices')
+            logging.info(input_data['input_embeds'].device)
+            logging.info(input_data['attention_mask'].device)
+            logging.info(input_data['labels'].device)
+
             # Optional mixup regularization
             if config.mixup_alpha > 0:
                 mixed_embeds, labels_a, labels_b, lam = mixup_data(
                     input_data['input_embeds'], 
                     input_data['labels'],
                     alpha=config.mixup_alpha,
-                    device=config.device
+                    device='cuda'
                 )
                 input_data['input_embeds'] = mixed_embeds
             
@@ -255,6 +264,7 @@ def train_epoch(model,
             # Log the actual loss value (not the scaled one)
             batch_loss = loss.item() * config.gradient_accumulation_steps if not hasattr(model, 'backward') else loss.item()
             total_loss += batch_loss
+            print(batch_loss)
             
             # Only update progress bar on rank 0
             if config.local_rank <= 0:
@@ -305,7 +315,7 @@ def validate(model,
                     llm_tokenizer=tokenizer,
                     system_prompt=system_prompt,
                     input_texts=batch['input_text'],
-                    device=config.device,
+                    device='cuda',
                     end_sym=config.end_sym
                 )
                 
@@ -333,9 +343,9 @@ def validate(model,
     # Synchronize loss across all GPUs when using DeepSpeed
     if config.deepspeed and torch.distributed.is_initialized():
         # Sum up the total loss
-        torch.distributed.all_reduce(torch.tensor([total_loss]).to(config.device), op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(torch.tensor([total_loss]), op=torch.distributed.ReduceOp.SUM)
         # Get the correct divisor (total number of batches across all GPUs)
-        num_batches = torch.tensor([len(val_loader)]).to(config.device)
+        num_batches = torch.tensor([len(val_loader)])
         torch.distributed.all_reduce(num_batches, op=torch.distributed.ReduceOp.SUM)
         total_loss /= num_batches.item()
     else:
@@ -364,36 +374,6 @@ def get_scheduler(scheduler_type, optimizer, patience, factor, min_lr, t_max=Non
         logging.warning(f"Unknown scheduler type: {scheduler_type}. No scheduler will be used.")
         return None
 
-def setup_deepspeed_model(model, config, learning_rate):
-    """Set up DeepSpeed model, optimizer and scheduler"""
-    if config.deepspeed:
-        # DeepSpeed will handle the optimizer and scheduler internally
-        ds_config = None
-        
-        # Use a deepspeed config file if provided
-        if config.deepspeed_config and os.path.exists(config.deepspeed_config):
-            model_engine, optimizer, _, _ = deepspeed.initialize(
-                model=model,
-                config=config.deepspeed_config,
-                model_parameters=model.parameters()
-            )
-        else:
-            raise ValueError("DeepSpeed config file not found")
-        
-        model = model_engine
-        scheduler = None  # DeepSpeed may handle the scheduler internally
-    else:
-        # Traditional PyTorch setup
-        optimizer = torch.optim.AdamW(
-            model.parameters(), 
-            lr=learning_rate,
-            weight_decay=config.weight_decay
-        )
-        
-        scheduler = None
-    
-    return model, optimizer, scheduler
-
 def train_model(config: TrainingConfig,
                 llm: AutoModelForCausalLM,
                 tokenizer: AutoTokenizer,
@@ -405,10 +385,17 @@ def train_model(config: TrainingConfig,
                 num_epochs: int=None,
                 is_step_based: bool=True,
                 model_save_suffix: str="") -> Any:
+    
     # Initialize distributed training if using DeepSpeed
     if config.deepspeed and not torch.distributed.is_initialized():
         deepspeed.init_distributed()
-        config.local_rank = torch.distributed.get_rank()
+        config.local_rank = int(os.environ.get('LOCAL_RANK', -1))
+        device = f'cuda:{config.local_rank}'
+    else:
+        device = config.device
+        
+    if config.local_rank <= 0:
+        logging.info(f"Training on device: {device}")
     
     # Prepare the data
     train_data = data_preparation_func(config.train_data)
@@ -418,11 +405,12 @@ def train_model(config: TrainingConfig,
     if model is None:
         model = MambaCompressor(
             llm_input_size=llm.config.hidden_size,
-            device=config.device,
+            device=device,  # Pass device but don't move model
             tokenizer_len=len(tokenizer),
             mem_token_id=tokenizer.convert_tokens_to_ids('<MEM>'),
             mamba_path=config.mamba_path,
-        ).to(config.device)
+            enable_amp=config.amp
+        )
     
     # Create datasets and data loaders
     train_dataset = ConversationDataset(train_data, tokenizer)
@@ -430,34 +418,92 @@ def train_model(config: TrainingConfig,
     
     # Create data loaders with appropriate samplers for distributed training
     if config.deepspeed and torch.distributed.is_initialized():
-        train_sampler = DistributedSampler(train_dataset, shuffle=True)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False)
-        
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size, 
-            sampler=train_sampler
-        )
-        
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=batch_size, 
-            sampler=val_sampler
-        )
-    else:
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size, 
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=torch.distributed.get_world_size(),
+            rank=config.local_rank,
             shuffle=True
         )
-        
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=batch_size
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=torch.distributed.get_world_size(),
+            rank=config.local_rank,
+            shuffle=False
         )
+    else:
+        train_sampler = None
+        val_sampler = None
     
-    # Set up model with DeepSpeed or traditional optimizer
-    model, optimizer, scheduler = setup_deepspeed_model(model, config, learning_rate)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        pin_memory=True,
+        num_workers=4
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        sampler=val_sampler,
+        pin_memory=True,
+        num_workers=4
+    )
+    
+    # Set up DeepSpeed configuration
+    ds_config = {
+        "train_batch_size": 8,
+        "train_micro_batch_size_per_gpu": 1,
+        "gradient_accumulation_steps": 4,
+        
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": learning_rate,
+                "betas": [0.9, 0.999],
+                "eps": 1e-8,
+                "weight_decay": config.weight_decay
+            }
+        },
+        
+        "scheduler": {
+            "type": "WarmupDecayLR",
+            "params": {
+                "total_num_steps": 1000,
+                "warmup_min_lr": 0,
+                "warmup_max_lr": learning_rate,
+                "warmup_num_steps": 100,
+            }
+        },
+        
+        "fp16": {
+            "enabled": config.fp16,
+            "loss_scale": 0,
+            "loss_scale_window": 1000,
+            "initial_scale_power": 16,
+            "hysteresis": 2,
+            "min_loss_scale": 1
+        },
+        
+        "zero_optimization": {
+            "stage": config.zero_stage,
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+            "reduce_bucket_size": int(2e8),
+            "allgather_bucket_size": int(2e8)
+        },
+        
+        "gradient_clipping": config.gradient_clip_value,
+        "steps_per_print": 50,
+        "wall_clock_breakdown": False
+    }
+    
+    # Initialize DeepSpeed
+    model_engine, optimizer, _, scheduler = deepspeed.initialize(
+        model=model,
+        config=ds_config,
+        model_parameters=model.parameters(),
+    )
     
     # Set up scheduler if not handled by DeepSpeed
     if scheduler is None and not hasattr(model, 'get_lr'):
