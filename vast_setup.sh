@@ -11,8 +11,8 @@ echo "conda activate mambacompressor" >> ~/.bashrc
 source ~/.bashrc
 
 apt-get update && apt-get install ffmpeg libsm6 libxext6  -y
+apt-get install unzip -y
 
-"""
 conda install -c nvidia cuda-compiler -y
 pip uninstall bitsandbytes -y
 pip install --upgrade bitsandbytes
@@ -26,4 +26,8 @@ pip install -e .
 
 git config --global user.email "nganngants@gmail.com"
 git config --global user.name "nganngants"
-"""
+
+gdown --folder https://drive.google.com/drive/folders/1-CYUhPkADMc4I5sycGrT7TP78iTU87wN\?usp\=drive_link
+gdown 17nHhoVx8im-fjsY7cqFL2OrMwVusHMHJ
+
+unzip mamba_ckpt.zip

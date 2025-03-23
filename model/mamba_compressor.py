@@ -92,7 +92,7 @@ class MambaCompressor(nn.Module):
             json.dump(config, f)
 
     @classmethod
-    def from_pretrained(cls, path: str, device: str, tokenizer_len: int, mem_token_id: int):
+    def from_pretrained(cls, path: str, device: str, tokenizer_len: int):
         with open(os.path.join(path, "config.json"), "r") as f:
             config = json.load(f)
         
@@ -100,7 +100,7 @@ class MambaCompressor(nn.Module):
             llm_input_size=config["llm_input_size"],
             device=device,
             tokenizer_len=tokenizer_len,
-            mem_token_id=mem_token_id,
+            mem_token_id=config["mem_token_id"],
             mamba_path=os.path.join(path, "mamba")
         )
         
