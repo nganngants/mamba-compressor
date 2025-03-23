@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Directory setup - modify these paths as needed
-DATA_DIR="./data"
+DATA_DIR="./jsonl_TrainTesTval_VidDescHis_5_latest"
 OUTPUT_DIR="./hist_jsonl"
 EMBEDS_DIR="./hist_embeddings"
-MAMBA_MODEL_PATH=""
+MAMBA_MODEL_PATH="./mamba_compressor_videollama_stage1"
 LLM_NAME="DAMO-NLP-SG/VideoLLaMA2.1-7B-AV"
 INFERENCE_SCRIPT="./eval/inference_videollama.py"
 
@@ -13,7 +13,7 @@ mkdir -p $OUTPUT_DIR
 mkdir -p $EMBEDS_DIR
 
 # Run the inference script
-python run_inference_on_datasets.py \
+python scripts/run_inference_on_datasets.py \
   --inference_script $INFERENCE_SCRIPT \
   --data_dir $DATA_DIR \
   --output_dir $OUTPUT_DIR \

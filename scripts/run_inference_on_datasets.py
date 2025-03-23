@@ -91,7 +91,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Define dataset files
-    datasets = ["train", "val", "test"]
+    datasets = ["val"]
     
     for dataset in datasets:
         input_jsonl = os.path.join(args.data_dir, f"{dataset}.jsonl")
@@ -105,7 +105,7 @@ def main():
         dataset_embeds_dir = os.path.join(args.embeds_dir, dataset)
         os.makedirs(dataset_embeds_dir, exist_ok=True)
         
-        output_jsonl = os.path.join(args.output_dir, f"{dataset}_with_embeds.jsonl")
+        output_jsonl = os.path.join(args.output_dir, f"{dataset}.jsonl")
         
         logger.info(f"Processing {dataset} dataset")
         success = run_inference(

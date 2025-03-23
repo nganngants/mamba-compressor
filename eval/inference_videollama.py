@@ -8,18 +8,18 @@ import torch
 import logging
 import h5py
 import tqdm
+import traceback
 from pathlib import Path
 from typing import Dict, List, Any
 
 # Import the necessary modules
 from model import MambaCompressor
-from model.inputs import prepare_input
 from videollama2 import model_init
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | %(message)s',
+    format='%(asctime)s | %(levelname)s | %(message)s',
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
@@ -39,87 +39,112 @@ def save_jsonl(data: List[Dict[str, Any]], file_path: str):
         for item in data:
             f.write(json.dumps(item) + '\n')
 
-def process_data(
-    data: List[Dict[str, Any]],
+def process_sample(
+    sample: Dict[str, Any],
+    sample_idx: int,
     mamba_model: MambaCompressor,
-    llm,
     tokenizer,
     output_embeds_dir: str,
-    system_prompt: str = "You are a helpful assistant. Provided the compressed embeddings, please reconstruct the conversation.",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    batch_size: int = 8
-) -> List[Dict[str, Any]]:
-    """Process data and generate embeddings for each sample"""
+    debug: bool = False
+) -> Dict[str, Any]:
+    """Process a single sample to generate embeddings"""
     
-    os.makedirs(output_embeds_dir, exist_ok=True)
+    history_text = sample.get("history_chat_mamba", "")
+    dialogue_id = sample.get("Dialogue_ID", sample_idx)
     
-    mamba_model.eval()
-    llm.eval()
+    # Skip if no valid history text
+    if not history_text or not history_text.strip():
+        if debug:
+            logger.info(f"Sample {sample_idx} has no valid history text")
+        return sample
     
-    actual_mamba_model = mamba_model.module if hasattr(mamba_model, 'module') else mamba_model
-    
-    updated_data = []
-    
-    for i in tqdm.tqdm(range(0, len(data), batch_size), desc="Processing batches"):
-        batch = data[i:i+batch_size]
-        
-        # Extract history_chat_mamba from each sample
-        history_texts = [sample.get("history_chat_mamba", "") for sample in batch]
-        dialogue_ids = [sample.get("Dialogue_ID", i+idx) for idx, sample in enumerate(batch)]
-        
-        # Skip empty history texts
-        valid_indices = [idx for idx, text in enumerate(history_texts) if text.strip()]
-        if not valid_indices:
-            # Add samples without modification if no valid history
-            updated_data.extend(batch)
-            continue
-            
-        # Filter batch to only include samples with valid history
-        valid_batch = [batch[idx] for idx in valid_indices]
-        valid_texts = [history_texts[idx] for idx in valid_indices]
-        valid_dialogue_ids = [dialogue_ids[idx] for idx in valid_indices]
+    try:
+        # Tokenize the input text
+        input_ids = tokenizer(
+            [history_text],  # Single sample in a list
+            padding=True,
+            truncation=True,
+            return_tensors='pt',
+            max_length=512
+        ).to(device)
         
         # Process through MambaCompressor
         with torch.no_grad():
-            try:
-                # Prepare input for the MambaCompressor
-                input_data = prepare_input(
-                    mamba_model=actual_mamba_model,
-                    llm_model=llm,
-                    llm_tokenizer=tokenizer,
-                    system_prompt=system_prompt,
-                    input_texts=valid_texts,
-                    device=device
-                )
-                
-                # Save embeddings for each valid sample
-                for idx, (sample, dialogue_id) in enumerate(zip(valid_batch, valid_dialogue_ids)):
-                    # Create a unique filename for this sample
-                    sample_idx = i + valid_indices[idx]
-                    embeds_filename = f"hist_embeds_{dialogue_id}_{sample_idx}.h5"
-                    embeds_path = os.path.join(output_embeds_dir, embeds_filename)
-                    
-                    sample_embeds = input_data['input_embeds'][idx].detach().cpu().numpy()
-                    
-                    with h5py.File(embeds_path, 'w') as f:
-                        f.create_dataset('input_embeds', data=sample_embeds)
-                    
-                    sample['history_embeds_path'] = embeds_path
-                    updated_data.append(sample)
-                
-            except Exception as e:
-                logger.error(f"Error processing batch starting at index {i}: {str(e)}")
-                # Add samples without modification in case of error
-                for idx, sample in enumerate(batch):
-                    if idx in valid_indices:
-                        logger.warning(f"Skipping sample {i+idx} due to processing error")
-                    updated_data.append(sample)
-                continue
+            memory_features = mamba_model(input_ids)
         
-        # Add remaining samples from batch that didn't have valid history
-        for idx, sample in enumerate(batch):
-            if idx not in valid_indices:
-                updated_data.append(sample)
+        # Create a unique filename for this sample
+        embeds_filename = f"hist_embeds_{dialogue_id}_{sample_idx}.h5"
+        embeds_path = os.path.join(output_embeds_dir, embeds_filename)
+        
+        # Extract embeddings for this sample
+        sample_embeds = memory_features[0].detach().cpu().numpy()  # First (only) item in batch
+        
+        # Log shape for debugging
+        if debug:
+            logger.info(f"Sample {sample_idx} - Embedding shape: {sample_embeds.shape}")
+        
+        # Save embeddings to H5PY file
+        with h5py.File(embeds_path, 'w') as f:
+            f.create_dataset('input_embeds', data=sample_embeds)
+        
+        # Update sample with the path to embeddings
+        sample['history_embeds_path'] = embeds_path
+        return sample
+        
+    except Exception as e:
+        logger.error(f"Error processing sample {sample_idx}: {str(e)}")
+        if debug:
+            logger.error(traceback.format_exc())
+        return sample
+
+def process_data(
+    data: List[Dict[str, Any]],
+    mamba_model: MambaCompressor,
+    tokenizer,
+    output_embeds_dir: str,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    debug: bool = False
+) -> List[Dict[str, Any]]:
+    """Process data one sample at a time to avoid batch size issues"""
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_embeds_dir, exist_ok=True)
+    
+    # Set model to evaluation mode
+    mamba_model.eval()
+    
+    # Get the actual Mamba model if it's wrapped
+    actual_mamba_model = mamba_model.module if hasattr(mamba_model, 'module') else mamba_model
+    
+    # Process each sample individually
+    updated_data = []
+    success_count = 0
+    
+    for idx, sample in enumerate(tqdm.tqdm(data, desc="Processing samples")):
+        updated_sample = process_sample(
+            sample=sample,
+            sample_idx=idx,
+            mamba_model=actual_mamba_model,
+            tokenizer=tokenizer,
+            output_embeds_dir=output_embeds_dir,
+            device=device,
+            debug=debug
+        )
+        
+        # Check if embeddings were successfully generated
+        if 'history_embeds_path' in updated_sample:
+            success_count += 1
+            
+        updated_data.append(updated_sample)
+    
+    # Log final counts
+    logger.info(f"Total samples: {len(data)}")
+    logger.info(f"Successfully saved embeddings: {success_count}")
+    
+    # Verify output directory has the expected number of files
+    h5_files = [f for f in os.listdir(output_embeds_dir) if f.endswith('.h5')]
+    logger.info(f"H5 files in output directory: {len(h5_files)}")
     
     return updated_data
 
@@ -129,19 +154,35 @@ def main():
     parser.add_argument("--output_jsonl", type=str, required=True, help="Path to output JSONL file")
     parser.add_argument("--output_embeds_dir", type=str, required=True, help="Directory to save embedding H5PY files")
     parser.add_argument("--mamba_model_path", type=str, required=True, help="Path to trained MambaCompressor model")
-    parser.add_argument("--llm_name", type=str, required=True, help="Name or path of the LLM model")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for processing")
+    parser.add_argument("--llm_name", type=str, required=True, help="Name or path of the LLM model (for tokenizer only)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", 
                         help="Device to run on (cuda/cpu)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
+    
+    # Set debug level if requested
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        logger.info("Debug mode enabled")
     
     # Create output directories if they don't exist
     os.makedirs(os.path.dirname(args.output_jsonl), exist_ok=True)
     os.makedirs(args.output_embeds_dir, exist_ok=True)
     
-    # Load LLM and tokenizer
-    logger.info(f"Loading LLM: {args.llm_name}")
-    llm, _, tokenizer = model_init(args.llm_name)
+    # Check if output directory is writable
+    try:
+        test_file = os.path.join(args.output_embeds_dir, "test_write.tmp")
+        with open(test_file, 'w') as f:
+            f.write("test")
+        os.remove(test_file)
+        logger.info(f"Output directory {args.output_embeds_dir} is writable")
+    except Exception as e:
+        logger.error(f"Cannot write to output directory {args.output_embeds_dir}: {str(e)}")
+        return
+    
+    # Load LLM and tokenizer (only need tokenizer)
+    logger.info(f"Loading tokenizer from: {args.llm_name}")
+    _, _, tokenizer = model_init(args.llm_name)
     
     # Add special tokens to the tokenizer
     tokenizer.add_special_tokens(
@@ -156,6 +197,7 @@ def main():
         }
     )
     
+    # Get memory token ID
     mem_token_id = tokenizer.convert_tokens_to_ids('<MEM>')
     
     # Load MambaCompressor
@@ -172,22 +214,33 @@ def main():
     data = load_jsonl(args.input_jsonl)
     logger.info(f"Loaded {len(data)} samples")
     
+    # Check for history_chat_mamba presence
+    has_history = [bool(sample.get("history_chat_mamba", "").strip()) for sample in data]
+    logger.info(f"Samples with non-empty history_chat_mamba: {sum(has_history)}/{len(data)}")
+    
+    if sum(has_history) == 0:
+        logger.error("No samples have history_chat_mamba field. Please check your input data.")
+        return
+    
     # Process data
     logger.info("Processing data through MambaCompressor")
     updated_data = process_data(
         data=data,
         mamba_model=mamba_model,
-        llm=llm,
         tokenizer=tokenizer,
         output_embeds_dir=args.output_embeds_dir,
-        device=args.device,
-        batch_size=args.batch_size
+        device=device,
+        debug=args.debug
     )
     
     # Save updated data
     logger.info(f"Saving processed data to: {args.output_jsonl}")
     save_jsonl(updated_data, args.output_jsonl)
     logger.info(f"Saved {len(updated_data)} samples with embedding paths")
+    
+    # Report mismatch if present
+    saved_with_embeds = sum(1 for item in updated_data if 'history_embeds_path' in item)
+    logger.info(f"Samples with history_embeds_path field: {saved_with_embeds}/{len(updated_data)}")
     
     logger.info("Processing complete!")
 
