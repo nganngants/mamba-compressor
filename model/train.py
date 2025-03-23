@@ -1,35 +1,20 @@
-import argparse
-import logging
-from pathlib import Path
-from transformers import AutoModelForCausalLM, AutoTokenizer, MambaModel, BitsAndBytesConfig, AutoModelForVision2Seq
-import torch
-import torch.nn as nn
-from typing import Dict, Optional
+# import libraries
 from dataclasses import dataclass
-from data import (
-    ConversationDataset, 
-    prepare_single_utterances_data, 
-    prepare_multiple_utterances_data
-)
-# from vllm import LLM, SamplingParams
-
-from typing import List
-from model import MambaCompressor
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+import logging
+import numpy as np
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
-os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
-os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"  # Try disabling cuDNN v8 API
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # For better error reporting
+from typing import Optional, Tuple, Dict, Any, Callable
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
+from torch.utils.data import DataLoader, DistributedSampler
+import deepspeed
+import argparse
+from tqdm import tqdm
+from data import ConversationDataset, prepare_single_utterances_data, prepare_multiple_utterances_data
+from model import MambaCompressor
+from model.inputs import prepare_input
 
-# After imports, add these PyTorch settings
-torch.backends.cudnn.enabled = False
-torch.backends.cudnn.benchmark = False
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-
-logger = logging.getLogger(__name__)
 
 @dataclass
 class TrainingConfig:
@@ -46,156 +31,143 @@ class TrainingConfig:
     lr_single: float = 2.5e-5
     lr_conv: float = 1e-4
     max_length: int = 512
-    end_sym: str = '\n',
+    end_sym: str = '\n'
     load_in_4bit: bool = False
     compute_dtype: str = "float16"
     quant_type: str = "nf4"
     use_double_quant: bool = False
-
-def prepare_input(
-    mamba_model,
-    llm_model: AutoModelForCausalLM,
-    llm_tokenizer: AutoTokenizer,
-    system_prompt: str,
-    input_texts: List[str],
-    device: str = 'cuda',
-    end_sym: str = '\n'
-):
-    # print(f'Input texts: {input_texts}')
-    # Get Mamba memory features
-    input_ids = llm_tokenizer(
-        input_texts,
-        padding=True,
-        truncation=True,
-        return_tensors='pt',
-        max_length=512
-    ).to(device)
-
-    memory_features = mamba_model(input_ids).to(torch.float16)
-    atts_memory = torch.ones(
-        (memory_features.size(0), memory_features.size(1)),
-        dtype=torch.long,
-    ).to(device)
+    checkpoint_path: Optional[str] = None
     
-    # Combine system prompt with memory features
-    system_encodings = llm_tokenizer(
-        [system_prompt] * len(input_texts),
-        padding=True,
-        truncation=True,
-        return_tensors='pt',
-        max_length=64
-    ).to(device)
-    system_embeds = llm_model.model.embed_tokens(system_encodings['input_ids']) # (batch, seq, hidden)
-    # print(f'System encodings: {system_embeds.shape}')
-    # print(f'Memory features: {memory_features.shape}')
+    # Step-based validation and early stopping
+    eval_steps: int = 50  # Validate every N steps
+    patience_steps: int = 200  # Stop if no improvement after N steps
     
-    memory_features = torch.cat([system_embeds, memory_features], dim=1)
-    atts_memory = atts_memory[:, :1].expand(-1, memory_features.size(1))
+    # Traditional epoch-based early stopping (not used with step-based approach)
+    patience: int = 3  
+    
+    # LR scheduler
+    scheduler_type: str = "reduce_on_plateau"  # or "cosine"
+    scheduler_patience: int = 1
+    scheduler_factor: float = 0.5  # Reduce LR by half when plateau is detected
+    scheduler_min_lr: float = 1e-6
+    
+    # Optimization parameters
+    weight_decay: float = 0.01
+    gradient_accumulation_steps: int = 1
+    gradient_clip_value: float = 5.0
+    mixup_alpha: float = 0.0  # Mixup regularization, 0 = disabled
+    warmup_steps: int = 0
 
-    # Prepare target texts
-    target_texts = [t + end_sym for t in input_texts]
-    to_regress_tokens = llm_tokenizer(
-        target_texts,
-        truncation=True,
-        return_tensors="pt",
-        padding="longest",
-        max_length=512,
-    ).to(device)
-    targets = to_regress_tokens.input_ids.masked_fill(
-                to_regress_tokens.input_ids == llm_tokenizer.pad_token_id, -100
-            )
-    empty_targets = (
-                torch.ones([memory_features.shape[0], memory_features.shape[1]],
-                        dtype=torch.long).to(device).fill_(-100)
-            )
-    targets = torch.cat([empty_targets, targets], dim=1)
+    # DeepSpeed parameters
+    deepspeed: bool = True  # Set to True by default
+    deepspeed_config: Optional[str] = "ds_config.json"
+    local_rank: int = -1
+    zero_stage: int = 3
+    offload_optimizer: bool = True
+    offload_param: bool = True
+    fp16: bool = True
+    bf16: bool = False
+    pipeline_parallel_size: int = 1
+    tensor_parallel_size: int = 1
 
-    batch_size = memory_features.shape[0]
 
-    to_regress_embeds = llm_model.model.embed_tokens(to_regress_tokens.input_ids)
-    input_embeds = torch.cat([memory_features, to_regress_embeds], dim=1)
-    attention_mask = torch.cat([atts_memory, to_regress_tokens.attention_mask], dim=1)
+class EarlyStopping:
+    def __init__(self, patience=3, min_delta=0.0, restore_best_weights=True, step_based=False):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.restore_best_weights = restore_best_weights
+        self.counter = 0
+        self.best_loss = np.inf
+        self.best_weights = None
+        self.should_stop = False
+        self.step_based = step_based  # Whether this is step-based or epoch-based
+        self.steps_without_improvement = 0
 
-    return {
-        'input_embeds': input_embeds,
-        'attention_mask': attention_mask,
-        'labels': targets
-    }
+    def __call__(self, model, current_loss):
+        if current_loss < self.best_loss - self.min_delta:
+            self.best_loss = current_loss
+            self.counter = 0
+            self.steps_without_improvement = 0
+            if self.restore_best_weights:
+                # For DeepSpeed compatibility, save the model checkpoint instead of storing weights in memory
+                if hasattr(model, 'module'):
+                    is_ds_model = hasattr(model.module, 'save_checkpoint')
+                    if is_ds_model:
+                        # Save DeepSpeed checkpoint
+                        model.save_checkpoint("best_model_checkpoint")
+                        self.best_weights = "best_model_checkpoint"
+                    else:
+                        self.best_weights = {k: v.detach().cpu().clone() for k, v in model.module.state_dict().items()}
+                else:
+                    self.best_weights = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            return False
+        else:
+            if self.step_based:
+                self.steps_without_improvement += 1
+                if self.steps_without_improvement >= self.patience:
+                    self.should_stop = True
+                    if self.restore_best_weights and self.best_weights is not None:
+                        if isinstance(self.best_weights, str):
+                            # Load DeepSpeed checkpoint
+                            model.load_checkpoint(self.best_weights)
+                            logging.info("Restoring best weights from checkpoint after step-based early stopping triggered")
+                        else:
+                            if hasattr(model, 'module'):
+                                model.module.load_state_dict(self.best_weights)
+                            else:
+                                model.load_state_dict(self.best_weights)
+                            logging.info("Restoring best weights after step-based early stopping triggered")
+            else:
+                raise NotImplementedError("Epoch-based early stopping is not implemented yet")
+            
+        return self.should_stop
 
-def train_epoch(model: MambaCompressor,
+def mixup_data(input_embeds, labels, alpha=1.0, device='cuda'):
+    """Applies mixup augmentation to the embeddings"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    
+    batch_size = input_embeds.size(0)
+    index = torch.randperm(batch_size).to(device)
+    
+    mixed_input_embeds = lam * input_embeds + (1 - lam) * input_embeds[index, :]
+    return mixed_input_embeds, labels, labels[index], lam
+
+def train_epoch(model,
                 llm: AutoModelForCausalLM,
                 tokenizer: AutoTokenizer,
                 train_loader: DataLoader,
-                optimizer: torch.optim.Optimizer,
+                val_loader: DataLoader,
+                optimizer,
+                scheduler,
                 system_prompt: str,
-                config: TrainingConfig) -> float:
+                config: TrainingConfig,
+                early_stopping=None) -> Tuple[float, bool]:
     
-    model.train()
+    # Set the model to train mode (handled by DeepSpeed if using it)
+    if hasattr(model, 'train'):
+        model.train()
+    
     total_loss = 0
-    progress_bar = tqdm(train_loader)
+    progress_bar = tqdm(train_loader, desc="Training", disable=config.local_rank != 0)
     
     # Disable cuDNN optimizations for debugging
-    torch.backends.cudnn.enabled = False  # Temporary test
+    torch.backends.cudnn.enabled = False
     torch.backends.cudnn.benchmark = False
     
-    for batch in progress_bar:
-        optimizer.zero_grad()
-        input_data = prepare_input(
-            mamba_model=model,
-            llm_model=llm,
-            llm_tokenizer=tokenizer,
-            system_prompt=system_prompt,
-            input_texts=batch['input_text'],
-            device=config.device,
-            end_sym=config.end_sym
-        )
-        
-        # Debug shapes
-        print(f"Batch size: {len(batch['input_text'])}")
-        print(f"Input embeds: {input_data['input_embeds'].shape}")
-        print(f"Attention mask: {input_data['attention_mask'].shape}")
-        print(f"Labels: {input_data['labels'].shape}")
-        
+    # No need to manually zero gradients when using DeepSpeed
+    global_step = 0
+    stop_training = False
+    best_val_loss = float('inf')
+    
+    actual_mamba_model = model.module if hasattr(model, 'module') else model
+    
+    for i, batch in enumerate(progress_bar):
         try:
-            llm_outputs = llm(
-                inputs_embeds=input_data['input_embeds'],
-                attention_mask=input_data['attention_mask'],
-                labels=input_data['labels'],
-                return_dict=True
-            )
-        except RuntimeError as e:
-            print(f"Error during forward pass: {e}")
-            break
-        
-        loss = llm_outputs.loss
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        
-        total_loss += loss.item()
-        progress_bar.set_postfix({'loss': loss.item()})
-        
-        del input_data, llm_outputs
-        torch.cuda.empty_cache()
-        
-    # Re-enable cuDNN if needed
-    torch.backends.cudnn.enabled = True
-    return total_loss / len(train_loader)
-
-def validate(model: MambaCompressor,
-            llm: AutoModelForCausalLM,
-            tokenizer: AutoTokenizer,
-            val_loader: DataLoader,
-            system_prompt: str,
-            config: TrainingConfig) -> float:
-    
-    model.eval()
-    total_loss = 0
-    
-    with torch.no_grad():
-        for batch in val_loader:
             input_data = prepare_input(
-                mamba_model=model,
+                mamba_model=actual_mamba_model,
                 llm_model=llm,
                 llm_tokenizer=tokenizer,
                 system_prompt=system_prompt,
@@ -204,6 +176,16 @@ def validate(model: MambaCompressor,
                 end_sym=config.end_sym
             )
             
+            # Optional mixup regularization
+            if config.mixup_alpha > 0:
+                mixed_embeds, labels_a, labels_b, lam = mixup_data(
+                    input_data['input_embeds'], 
+                    input_data['labels'],
+                    alpha=config.mixup_alpha,
+                    device=config.device
+                )
+                input_data['input_embeds'] = mixed_embeds
+            
             llm_outputs = llm(
                 inputs_embeds=input_data['input_embeds'],
                 attention_mask=input_data['attention_mask'],
@@ -211,19 +193,228 @@ def validate(model: MambaCompressor,
                 return_dict=True
             )
             
-            total_loss += llm_outputs.loss.item()
+            loss = llm_outputs.loss
             
-    return total_loss / len(val_loader)
+            # Using DeepSpeed's backward
+            if hasattr(model, 'backward'):
+                model.backward(loss)
+                model.step()
+            else:
+                # Apply loss scaling for gradient accumulation if not using DeepSpeed
+                loss = loss / config.gradient_accumulation_steps
+                loss.backward()
+                
+                # Gradient accumulation
+                if (i + 1) % config.gradient_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(actual_mamba_model.parameters(), config.gradient_clip_value)
+                    optimizer.step()
+                    optimizer.zero_grad()
+            
+            # Step the scheduler if it's not ReduceLROnPlateau
+            if scheduler is not None and not isinstance(scheduler, ReduceLROnPlateau) and (i + 1) % config.gradient_accumulation_steps == 0:
+                scheduler.step()
+            
+            global_step += 1
+            
+            # Step-based validation and early stopping
+            if config.eval_steps > 0 and global_step % config.eval_steps == 0:
+                val_loss = validate(model, llm, tokenizer, val_loader, system_prompt, config)
+                
+                # Set the model back to train mode
+                if hasattr(model, 'train'):
+                    model.train()
+                
+                # Only log on rank 0 if using distributed training
+                if config.local_rank <= 0:
+                    current_lr = optimizer.param_groups[0]["lr"] if not hasattr(model, 'lr') else model.get_lr()[0]
+                    logging.info(f'Step {global_step} - Validation loss: {val_loss:.4f}, LR: {current_lr}')
+                
+                # For ReduceLROnPlateau scheduler
+                if scheduler is not None and isinstance(scheduler, ReduceLROnPlateau):
+                    scheduler.step(val_loss)
+                
+                # Step-based early stopping check
+                if early_stopping is not None and early_stopping.step_based:
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        # Save the best model
+                        if hasattr(model, 'save_checkpoint'):
+                            model.save_checkpoint(f"{config.model_dir}_step_best")
+                        else:
+                            torch.save(actual_mamba_model.state_dict(), f"{config.model_dir}_step_best.pt")
+                        
+                        if config.local_rank <= 0:
+                            logging.info(f"Saved best model at step {global_step} with validation loss: {val_loss:.4f}")
+                    
+                    if early_stopping(model, val_loss):
+                        if config.local_rank <= 0:
+                            logging.info(f"Early stopping triggered at step {global_step}")
+                        stop_training = True
+                        break
+            
+            # Log the actual loss value (not the scaled one)
+            batch_loss = loss.item() * config.gradient_accumulation_steps if not hasattr(model, 'backward') else loss.item()
+            total_loss += batch_loss
+            
+            # Only update progress bar on rank 0
+            if config.local_rank <= 0:
+                current_lr = optimizer.param_groups[0]["lr"] if not hasattr(model, 'lr') else model.get_lr()[0]
+                progress_bar.set_postfix({'loss': batch_loss, 'lr': current_lr, 'step': global_step})
+            
+            del input_data, llm_outputs
+            torch.cuda.empty_cache()
+            
+        except RuntimeError as e:
+            logging.error(f"Error during forward pass: {e}")
+            torch.cuda.empty_cache()
+            continue
+        
+        if stop_training:
+            break
+    
+    avg_loss = total_loss / len(train_loader)
+    
+    # For ReduceLROnPlateau scheduler - only if not using step-based validation
+    if config.eval_steps <= 0 and scheduler is not None and isinstance(scheduler, ReduceLROnPlateau):
+        scheduler.step(avg_loss)
+        
+    return avg_loss, stop_training
 
-def train_single_utterance(config: TrainingConfig,
-                         llm: AutoModelForCausalLM,
-                         tokenizer: AutoTokenizer,
-                         model_dir: str,
-                         model: Optional[MambaCompressor] = None) -> MambaCompressor:
+def validate(model,
+            llm: AutoModelForCausalLM,
+            tokenizer: AutoTokenizer,
+            val_loader: DataLoader,
+            system_prompt: str,
+            config: TrainingConfig) -> float:
     
-    train_data = prepare_single_utterances_data(config.train_data)
-    valid_data = prepare_single_utterances_data(config.valid_data)
+    # Set model to eval mode
+    if hasattr(model, 'eval'):
+        model.eval()
     
+    total_loss = 0
+    progress_bar = tqdm(val_loader, desc="Validating", disable=config.local_rank != 0)
+    
+    actual_mamba_model = model.module if hasattr(model, 'module') else model
+    
+    with torch.no_grad():
+        for batch in progress_bar:
+            try:
+                input_data = prepare_input(
+                    mamba_model=actual_mamba_model,
+                    llm_model=llm,
+                    llm_tokenizer=tokenizer,
+                    system_prompt=system_prompt,
+                    input_texts=batch['input_text'],
+                    device=config.device,
+                    end_sym=config.end_sym
+                )
+                
+                llm_outputs = llm(
+                    inputs_embeds=input_data['input_embeds'],
+                    attention_mask=input_data['attention_mask'],
+                    labels=input_data['labels'],
+                    return_dict=True
+                )
+                
+                batch_loss = llm_outputs.loss.item()
+                total_loss += batch_loss
+                
+                if config.local_rank <= 0:
+                    progress_bar.set_postfix({'val_loss': batch_loss})
+                
+                del input_data, llm_outputs
+                torch.cuda.empty_cache()
+                
+            except RuntimeError as e:
+                logging.error(f"Error during validation: {e}")
+                torch.cuda.empty_cache()
+                continue
+    
+    # Synchronize loss across all GPUs when using DeepSpeed
+    if config.deepspeed and torch.distributed.is_initialized():
+        # Sum up the total loss
+        torch.distributed.all_reduce(torch.tensor([total_loss]).to(config.device), op=torch.distributed.ReduceOp.SUM)
+        # Get the correct divisor (total number of batches across all GPUs)
+        num_batches = torch.tensor([len(val_loader)]).to(config.device)
+        torch.distributed.all_reduce(num_batches, op=torch.distributed.ReduceOp.SUM)
+        total_loss /= num_batches.item()
+    else:
+        total_loss /= len(val_loader)
+    
+    return total_loss
+
+def get_scheduler(scheduler_type, optimizer, patience, factor, min_lr, t_max=None):
+    """Returns the appropriate learning rate scheduler based on config"""
+    if scheduler_type == "reduce_on_plateau":
+        return ReduceLROnPlateau(
+            optimizer, 
+            mode='min', 
+            factor=factor,
+            patience=patience, 
+            verbose=True,
+            min_lr=min_lr
+        )
+    elif scheduler_type == "cosine":
+        return CosineAnnealingLR(
+            optimizer,
+            T_max=t_max if t_max is not None else 10,
+            eta_min=min_lr
+        )
+    else:
+        logging.warning(f"Unknown scheduler type: {scheduler_type}. No scheduler will be used.")
+        return None
+
+def setup_deepspeed_model(model, config, learning_rate):
+    """Set up DeepSpeed model, optimizer and scheduler"""
+    if config.deepspeed:
+        # DeepSpeed will handle the optimizer and scheduler internally
+        ds_config = None
+        
+        # Use a deepspeed config file if provided
+        if config.deepspeed_config and os.path.exists(config.deepspeed_config):
+            model_engine, optimizer, _, _ = deepspeed.initialize(
+                model=model,
+                config=config.deepspeed_config,
+                model_parameters=model.parameters()
+            )
+        else:
+            raise ValueError("DeepSpeed config file not found")
+        
+        model = model_engine
+        scheduler = None  # DeepSpeed may handle the scheduler internally
+    else:
+        # Traditional PyTorch setup
+        optimizer = torch.optim.AdamW(
+            model.parameters(), 
+            lr=learning_rate,
+            weight_decay=config.weight_decay
+        )
+        
+        scheduler = None
+    
+    return model, optimizer, scheduler
+
+def train_model(config: TrainingConfig,
+                llm: AutoModelForCausalLM,
+                tokenizer: AutoTokenizer,
+                model_dir: str,
+                model=None,
+                data_preparation_func: Callable=None,
+                learning_rate: float=None,
+                batch_size: int=None,
+                num_epochs: int=None,
+                is_step_based: bool=True,
+                model_save_suffix: str="") -> Any:
+    # Initialize distributed training if using DeepSpeed
+    if config.deepspeed and not torch.distributed.is_initialized():
+        deepspeed.init_distributed()
+        config.local_rank = torch.distributed.get_rank()
+    
+    # Prepare the data
+    train_data = data_preparation_func(config.train_data)
+    valid_data = data_preparation_func(config.valid_data)
+    
+    # Initialize the model if not provided
     if model is None:
         model = MambaCompressor(
             llm_input_size=llm.config.hidden_size,
@@ -233,140 +424,145 @@ def train_single_utterance(config: TrainingConfig,
             mamba_path=config.mamba_path,
         ).to(config.device)
     
+    # Create datasets and data loaders
     train_dataset = ConversationDataset(train_data, tokenizer)
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size_single, shuffle=True)
     val_dataset = ConversationDataset(valid_data, tokenizer)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size_single)
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr_single)
-    system_prompt = "Please reconstruct the conversation in a natural way."
+    # Create data loaders with appropriate samplers for distributed training
+    if config.deepspeed and torch.distributed.is_initialized():
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            sampler=train_sampler
+        )
+        
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=batch_size, 
+            sampler=val_sampler
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=True
+        )
+        
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=batch_size
+        )
     
-    for epoch in range(config.epochs_single):
-        train_loss = train_epoch(model, llm, tokenizer, train_loader, optimizer, system_prompt, config)
-        val_loss = validate(model, llm, tokenizer, val_loader, system_prompt, config)
-        logging.info(f'Epoch {epoch+1} - Train loss: {train_loss:.4f}, Val loss: {val_loss:.4f}')
+    # Set up model with DeepSpeed or traditional optimizer
+    model, optimizer, scheduler = setup_deepspeed_model(model, config, learning_rate)
     
-    model.save_pretrained(model_dir)
+    # Set up scheduler if not handled by DeepSpeed
+    if scheduler is None and not hasattr(model, 'get_lr'):
+        scheduler = get_scheduler(
+            config.scheduler_type,
+            optimizer,
+            config.scheduler_patience,
+            config.scheduler_factor,
+            config.scheduler_min_lr,
+            t_max=num_epochs * len(train_loader)
+        )
+    
+    system_prompt = "You are a helpful assistant. Provided the compressed embeddings, please reconstruct the conversation."
+    
+    # Initialize early stopping
+    if is_step_based:
+        early_stopping = EarlyStopping(
+            patience=config.patience_steps, 
+            restore_best_weights=True,
+            step_based=True
+        )
+        if config.local_rank <= 0:
+            logging.info(f"Using step-based early stopping with patience of {config.patience_steps} steps")
+    else:
+        raise NotImplementedError("Epoch-based early stopping is not implemented yet")
+    
+    best_val_loss = float('inf')
+    
+    # Training loop
+    for epoch in range(num_epochs):
+        # Set epoch for DistributedSampler if using deepspeed
+        if config.deepspeed and torch.distributed.is_initialized():
+            train_loader.sampler.set_epoch(epoch)
+        
+        # If using step-based validation, we pass the validation loader and early stopping to train_epoch
+        if is_step_based:
+            train_loss, stop_training = train_epoch(
+                model, llm, tokenizer, train_loader, val_loader, optimizer, scheduler, 
+                system_prompt, config, early_stopping
+            )
+            if config.local_rank <= 0:
+                current_lr = optimizer.param_groups[0]["lr"] if not hasattr(model, 'get_lr') else model.get_lr()[0]
+                logging.info(f'Epoch {epoch+1} completed - Train loss: {train_loss:.4f}, LR: {current_lr}')
+            
+            if stop_training:
+                if config.local_rank <= 0:
+                    logging.info(f"Early stopping triggered during epoch {epoch+1}")
+                break
+        else:
+            raise NotImplementedError("Epoch-based early stopping is not implemented yet")
+    
+    # Final save (only on rank 0)
+    if config.local_rank <= 0:
+        if hasattr(model, 'save_checkpoint'):
+            model.save_checkpoint(f"{model_dir}{model_save_suffix}")
+        else:
+            if hasattr(model, 'module'):
+                model.module.save_pretrained(f"{model_dir}{model_save_suffix}")
+            else:
+                model.save_pretrained(f"{model_dir}{model_save_suffix}")
+    
     return model
+
+def train_single_utterance(config: TrainingConfig,
+                         llm: AutoModelForCausalLM,
+                         tokenizer: AutoTokenizer,
+                         model_dir: str,
+                         model: Optional[MambaCompressor] = None) -> MambaCompressor:
+    """Train on single utterance data"""
+    if config.local_rank <= 0:
+        logging.info("Training single utterances")
+    
+    return train_model(
+        config=config,
+        llm=llm,
+        tokenizer=tokenizer,
+        model_dir=model_dir,
+        model=model,
+        data_preparation_func=prepare_single_utterances_data,
+        learning_rate=config.lr_single,
+        batch_size=config.batch_size_single,
+        num_epochs=config.epochs_single,
+        is_step_based=(config.eval_steps > 0),
+        model_save_suffix="_single"
+    )
 
 def train_conversations(config: TrainingConfig,
                        llm: AutoModelForCausalLM,
                        tokenizer: AutoTokenizer,
-                       model: MambaCompressor,
+                       model,
                        model_dir: str):
+    """Train on conversation data"""
+    if config.local_rank <= 0:
+        logging.info("Training multiple utterances")
     
-    train_data = prepare_multiple_utterances_data(config.train_data)
-    valid_data = prepare_multiple_utterances_data(config.valid_data)
-    
-    train_dataset = ConversationDataset(train_data, tokenizer)
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size_conv, shuffle=True)
-    val_dataset = ConversationDataset(valid_data, tokenizer)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size_conv)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr_conv)
-    system_prompt = "You are a helpful assistant. Provided the compressed embeddings, please reconstruct the conversation."
-    
-    for epoch in range(config.epochs_conv):
-        train_loss = train_epoch(model, llm, tokenizer, train_loader, optimizer, system_prompt, config)
-        val_loss = validate(model, llm, tokenizer, val_loader, system_prompt, config)
-        logging.info(f'Epoch {epoch+1} - Train loss: {train_loss:.4f}, Val loss: {val_loss:.4f}')
-    
-    model.save_pretrained(model_dir)
-
-def setup_logging(log_dir: Path):
-    log_dir.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s | %(message)s',
-        handlers=[
-            logging.FileHandler(log_dir / 'training.log'),
-            logging.StreamHandler()
-        ]
-    )
-
-def load_llm_and_tokenizer(config: TrainingConfig):
-    """Load LLM and tokenizer with proper quantization settings"""
-    quantization_config = None
-    if config.load_in_4bit:
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=getattr(torch, config.compute_dtype),
-            bnb_4bit_quant_type=config.quant_type,
-            bnb_4bit_use_double_quant=config.use_double_quant,
-        )
-    
-    tokenizer = AutoTokenizer.from_pretrained(config.llm_name, add_bos_token=True)
-    if not tokenizer.pad_token:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # add <MEM> token to tokenizer
-    tokenizer.add_special_tokens({'additional_special_tokens': ['<MEM>']})
-        
-    # model = LLM(config.llm_name, dtype=torch.bfloat16, trust_remote_code=True,
-    #         quantization="bitsandbytes", load_format="bitsandbytes")
-
-
-    model = AutoModelForCausalLM.from_pretrained(
-        config.llm_name,
-        device_map=config.device,
-        quantization_config=quantization_config,
-        torch_dtype=getattr(torch, config.compute_dtype),
-        trust_remote_code=True,
-        use_flash_attention_2=False
-    )
-    
-    # Move model to device explicitly if not using device_map
-    if not config.load_in_4bit and config.device != "auto":
-        model = model.to(config.device)
-        
-    return model, tokenizer
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mamba_path", required=False, default="state-spaces/mamba-370m-hf", help="Path to pretrained Mamba model")
-    parser.add_argument("--train_data", required=True, help="Path to training jsonl")
-    parser.add_argument("--valid_data", required=True, help="Path to validation jsonl")
-    parser.add_argument("--model_dir", required=True, help="Directory to save model checkpoints")
-    parser.add_argument("--llm_name", required=True, help="Name of the LLM model")
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--batch_size_single", type=int, default=8)
-    parser.add_argument("--batch_size_conv", type=int, default=1)
-    parser.add_argument("--epochs_single", type=int, default=3)
-    parser.add_argument("--epochs_conv", type=int, default=2)
-    parser.add_argument("--lr_single", type=float, default=2.5e-5)
-    parser.add_argument("--lr_conv", type=float, default=1e-4)
-    parser.add_argument("--max_length", type=int, default=512)
-    parser.add_argument("--end_sym", default="\n")
-    parser.add_argument("--load_in_4bit", action="store_true")
-    parser.add_argument("--compute_dtype", default="float16")
-    parser.add_argument("--quant_type", default="nf4")
-    parser.add_argument("--use_double_quant", action="store_true")
-    
-    args = parser.parse_args()
-    config = TrainingConfig(**vars(args))
-
-    logger.info(config)
-    
-    setup_logging(Path(config.model_dir))
-    
-    llm, tokenizer = load_llm_and_tokenizer(config)
-    
-    # Training stages
-    model = train_single_utterance(
+    return train_model(
         config=config,
         llm=llm,
         tokenizer=tokenizer,
-        model_dir=f"{config.model_dir}_stage1"
-    )
-    
-    train_conversations(
-        config=config,
-        llm=llm,
-        tokenizer=tokenizer,
+        model_dir=model_dir,
         model=model,
-        model_dir=f"{config.model_dir}_stage2"
+        data_preparation_func=prepare_multiple_utterances_data,
+        learning_rate=config.lr_conv,
+        batch_size=config.batch_size_conv,
+        num_epochs=config.epochs_conv,
+        is_step_based=(config.eval_steps > 0),
+        model_save_suffix="_conv"
     )
-
-if __name__ == "__main__":
-
-    main()

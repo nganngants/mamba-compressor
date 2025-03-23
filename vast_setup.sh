@@ -12,7 +12,6 @@ source ~/.bashrc
 
 apt-get update && apt-get install ffmpeg libsm6 libxext6  -y
 
-"""
 conda install -c nvidia cuda-compiler -y
 pip uninstall bitsandbytes -y
 pip install --upgrade bitsandbytes
@@ -26,4 +25,6 @@ pip install -e .
 
 git config --global user.email "nganngants@gmail.com"
 git config --global user.name "nganngants"
-"""
+
+gdown --folder https://drive.google.com/drive/folders/1-CYUhPkADMc4I5sycGrT7TP78iTU87wN?usp=drive_link
+gdown 1IU-BOzb2e2h6uv4bnnpa8fYZ7cnIFF4N
