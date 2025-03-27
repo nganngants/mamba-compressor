@@ -11,8 +11,6 @@ from model.inputs import prepare_input
 from data import ConversationDataset, prepare_single_utterances_data, prepare_multiple_utterances_data
 from dataclasses import dataclass
 
-from model.train_videollama import mixup_data
-
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -57,6 +55,25 @@ class TrainingConfig:
     mixup_alpha: float = 0.0  # Mixup regularization, 0 = disabled
     warmup_steps: int = 0
 
+    local_rank: int = -1
+    deepspeed: str = "ds_config.json"
+
+
+def mixup_data(input_embeds, labels, alpha=1.0, device='cuda'):
+    """Applies mixup augmentation to the embeddings"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    
+    batch_size = input_embeds.size(0)
+    index = torch.randperm(batch_size).to(device)
+    
+    mixed_input_embeds = lam * input_embeds + (1 - lam) * input_embeds[index, :]
+    return mixed_input_embeds, labels, labels[index], lam
+
+
+
 class EarlyStopping:
     def __init__(self, patience=3, min_delta=0.0, restore_best_weights=True, step_based=False):
         self.patience = patience
@@ -100,8 +117,6 @@ def train_epoch(model,
                 tokenizer: AutoTokenizer,
                 train_loader: DataLoader,
                 val_loader: DataLoader,
-                optimizer: torch.optim.Optimizer,
-                scheduler,
                 system_prompt: str,
                 config: TrainingConfig,
                 early_stopping=None) -> Tuple[float, bool]:
@@ -349,7 +364,7 @@ def train_conversations(config: TrainingConfig,
 
     for epoch in range(config.epochs_conv):
         train_loss = train_epoch(
-            model, llm, tokenizer, train_loader, val_loader, optimizer, scheduler, system_prompt, config
+            model, llm, tokenizer, train_loader, val_loader, system_prompt, config
         )
         val_loss = validate(model, llm, tokenizer, val_loader, system_prompt, config)
         

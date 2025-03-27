@@ -19,20 +19,6 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(filename='training.log', level=logging.INFO)
 
 
-def mixup_data(input_embeds, labels, alpha=1.0, device='cuda'):
-    """Applies mixup augmentation to the embeddings"""
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-    
-    batch_size = input_embeds.size(0)
-    index = torch.randperm(batch_size).to(device)
-    
-    mixed_input_embeds = lam * input_embeds + (1 - lam) * input_embeds[index, :]
-    return mixed_input_embeds, labels, labels[index], lam
-
-
 def setup_logging(log_dir: Path):
     log_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(

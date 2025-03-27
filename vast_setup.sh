@@ -14,7 +14,7 @@ apt-get update && apt-get install ffmpeg libsm6 libxext6  -y
 apt-get install unzip -y
 
 # conda install -c nvidia cuda-compiler -y
-conda activate mambacompressor
+# conda activate mambacompressor
 pip uninstall bitsandbytes -y
 pip install --upgrade bitsandbytes
 pip install deepspeed
