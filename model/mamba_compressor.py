@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 import os
 import json
+from typing import List
 import torch
 import torch.nn as nn
 from transformers import (
@@ -115,3 +116,7 @@ class LLMConfig:
    compute_dtype: torch.dtype = torch.float16
    quant_type: str = "nf4"
    use_double_quant: bool = True
+
+   lora_r: int = 32
+   lora_alpha: int = 64
+   lora_dropout: float = 0.05

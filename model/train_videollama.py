@@ -12,6 +12,7 @@ import deepspeed
 from model import MambaCompressor
 import os
 from model.train import train_single_utterance, train_conversations
+from peft import LoraConfig, get_peft_model
 
 logger = logging.getLogger(__name__)
 
@@ -30,26 +31,47 @@ def setup_logging(log_dir: Path):
         ]
     )
 
-def load_llm_and_tokenizer(config: TrainingConfig):
-    """Load LLM and tokenizer with proper quantization settings"""
+def find_all_linear_names(model):
+    cls = torch.nn.Linear
+    lora_module_names = set()
+    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler']
+    for name, module in model.named_modules():
+        if any(mm_keyword in name for mm_keyword in multimodal_keywords):
+            continue
+        if isinstance(module, cls):
+            names = name.split('.')
+            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
+    if 'lm_head' in lora_module_names: # needed for 16-bit
+        lora_module_names.remove('lm_head')
+    return list(lora_module_names)
+
+def load_llm_and_tokenizer(config: TrainingConfig):
     model, _, tokenizer = model_init(config.llm_name)
-    tokenizer.add_special_tokens(
-        {'additional_special_tokens': 
-            [
-                '<|im_start|>', 
-                '<|im_end|>',
-                '<history>',
-                '<video>',
-                '<MEM>'
-            ]
-        }
+    
+    # Add LoRA config
+    lora_config = LoraConfig(
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        target_modules=find_all_linear_names(model),
+        lora_dropout=config.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM"
     )
+    
+    # Convert to LoRA
+    model = get_peft_model(model, lora_config)
+    
+    # Add special tokens
+    tokenizer.add_special_tokens({
+        'additional_special_tokens': ['<|im_start|>', '<|im_end|>', '<history>', '<video>', '<MEM>']
+    })
 
     for param in model.parameters():
         param.requires_grad = False
-   
+
     return model, tokenizer
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -96,6 +118,10 @@ def main():
     # DeepSpeed arguments
     parser.add_argument("--local_rank", type=int, default=-1) # 
     parser.add_argument("--deepspeed", type=str, default=None)
+
+    parser.add_argument("--lora_r", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=16) 
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
     
     args = parser.parse_args()
     config = TrainingConfig(**vars(args))
