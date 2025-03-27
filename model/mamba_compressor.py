@@ -16,45 +16,32 @@ import logging
 logger = logging.getLogger(__name__)
 
 class MambaCompressor(nn.Module):
-    def __init__(self, 
-                 llm_input_size: int, 
-                 device: str, 
-                 tokenizer_len: int,
-                 mem_token_id: int,
-                 mamba_path: str = "state-spaces/mamba-370m-hf"):
+    def __init__(self, llm_input_size: int, device: str, tokenizer_len, mem_token_id, mamba_path: str = "state-spaces/mamba-370m-hf"):
+        """
+        Initialize MambaCompressor with a frozen Qwen LLM for reconstruction training
+        Args:
+            mamba_path: Path to pretrained Mamba model
+            llm_path: Path to Qwen LLM
+            torch_dtype: Data type for model loading (helps with DeepSpeed compatibility)
+        """
         super().__init__()
-        self.mamba = MambaModel.from_pretrained(mamba_path)
+        # Add DeepSpeed-specific parameters for model loading
+        self.mamba = MambaModel.from_pretrained(
+            mamba_path
+        )
+        
         self.mamba.resize_token_embeddings(tokenizer_len)
         self.mem_token_id = mem_token_id
-        self.memory_projection = nn.Linear(self.mamba.config.hidden_size, llm_input_size)
+        
+        
+        mamba_hidden = self.mamba.config.hidden_size
+        self.memory_projection = nn.Linear(mamba_hidden, llm_input_size)
         self.device = device
-        logger.info(
-            f"Loaded Mamba model from {mamba_path} "
-            f"with hidden size {self.mamba.config.hidden_size} and "
-            f"memory projection to size {llm_input_size}"
-            f"Memory token ID: {mem_token_id}"
-        )
 
     def forward(self, input_ids):
-        """Process input tokens and extract memory features.
-
-        Args:
-            input_ids (torch.Tensor): Input tensor of shape (batch_size, sequence_length) 
-                                    containing token IDs with special memory tokens
-
-        Returns:
-            torch.Tensor: Projected memory features for each batch item
-
-        The function performs these steps:
-        1. Passes input through Mamba model to get hidden states
-        2. Locates all <MEM> tokens in the input
-        3. Extracts features at <MEM> token positions
-        4. Projects features to target LLM dimension
-        """
-        # Get hidden states from Mamba model
-        outputs = self.mamba(input_ids['input_ids'].to(self.device)).last_hidden_state
-
-        mem_token_mask = input_ids['input_ids'] == self.mem_token_id
+        outputs = self.mamba(input_ids).last_hidden_state
+     
+        mem_token_mask = input_ids == self.mem_token_id
        
         batch_indices = torch.arange(outputs.size(0), device=outputs.device)[:, None]
         mem_positions = mem_token_mask.nonzero()
@@ -68,6 +55,13 @@ class MambaCompressor(nn.Module):
             batch_positions = seq_positions[batch_mask]
             batch_features = outputs[batch_idx, batch_positions]
             memory_features.append(batch_features)
+
+        # Handle different in sequence length
+        max_seq_len = max([len(mem) for mem in memory_features])
+        for i, mem in enumerate(memory_features):
+            if len(mem) < max_seq_len:
+                pad_len = max_seq_len - len(mem)
+                memory_features[i] = torch.cat([mem, torch.zeros(pad_len, mem.size(-1), device=mem.device)], dim=0)
         
         memory_features = torch.stack(memory_features)
 
