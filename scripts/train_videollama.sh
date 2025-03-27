@@ -2,14 +2,14 @@
 
 python model/train_videollama.py \
     --mamba_path "state-spaces/mamba-370m-hf" \
-    --train_data "jsonl_TrainTesTval_VidDescHis_5_latest/train.jsonl" \
-    --valid_data "jsonl_TrainTesTval_VidDescHis_5_latest/val.jsonl" \
+    --train_data "jsonl_TrainTesTval_noVidDesc_latest/train.jsonl" \
+    --valid_data "jsonl_TrainTesTval_noVidDesc_latest/val.jsonl" \
     --model_dir "./mamba_compressor_log" \
     --llm_name "DAMO-NLP-SG/VideoLLaMA2.1-7B-AV" \
     --batch_size_single 1 \
     --batch_size_conv 1 \
     --epochs_single 2 \
-    --epochs_conv 2 \
+    --epochs_conv 1 \
     --lr_single 5e-5 \
     --lr_conv 1e-4 \
     --device cuda \
@@ -17,8 +17,8 @@ python model/train_videollama.py \
     --compute_dtype float16 \
     --quant_type nf4 \
     --use_double_quant \
-    --eval_steps 50 \
-    --patience_steps 200 \
+    --eval_steps 500 \
+    --patience_steps 2 \
     --scheduler_type reduce_on_plateau \
     --scheduler_factor 0.5 \
     --scheduler_min_lr 1e-6 \

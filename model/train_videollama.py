@@ -128,10 +128,10 @@ def prepare_input(
     # Get Mamba memory features
     input_ids = llm_tokenizer(
         input_texts,
-        padding=True,
+        # padding=True,
         truncation=True,
         return_tensors='pt',
-        max_length=512
+        max_length=1024
     ).to(device)
 
     memory_features = mamba_model(input_ids).to(torch.float16)
@@ -159,8 +159,7 @@ def prepare_input(
         target_texts,
         truncation=True,
         return_tensors="pt",
-        padding="longest",
-        max_length=512,
+        max_length=1024,
     ).to(device)
     targets = to_regress_tokens.input_ids.masked_fill(
                 to_regress_tokens.input_ids == llm_tokenizer.pad_token_id, -100
@@ -634,13 +633,17 @@ def main():
         model.load_state_dict(state_dict)
         print(f"Loaded model from checkpoint {config.checkpoint_path}")
 
-    model = train_single_utterance(
-        config=config,
-        llm=llm,
-        tokenizer=tokenizer,
-        model_dir=f"{config.model_dir}_stage1",
-        model=model
-    )
+
+    # model = train_single_utterance(
+    #     config=config,
+    #     llm=llm,
+    #     tokenizer=tokenizer,
+    #     model_dir=f"{config.model_dir}_stage1",
+    #     model=model
+    # )
+    model = MambaCompressor.from_pretrained("./mamba_compressor_videollama_stage1", device="cuda", tokenizer_len=len(tokenizer))
+
+    model.to("cuda")
     
     train_conversations(
         config=config,

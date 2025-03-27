@@ -39,9 +39,9 @@ class MambaCompressor(nn.Module):
         self.device = device
 
     def forward(self, input_ids):
-        outputs = self.mamba(input_ids).last_hidden_state
+        outputs = self.mamba(input_ids["input_ids"].to(self.device)).last_hidden_state
      
-        mem_token_mask = input_ids == self.mem_token_id
+        mem_token_mask = input_ids["input_ids"] == self.mem_token_id
        
         batch_indices = torch.arange(outputs.size(0), device=outputs.device)[:, None]
         mem_positions = mem_token_mask.nonzero()
@@ -87,21 +87,24 @@ class MambaCompressor(nn.Module):
 
     @classmethod
     def from_pretrained(cls, path: str, device: str, tokenizer_len: int):
-        with open(os.path.join(path, "config.json"), "r") as f:
-            config = json.load(f)
-        
-        model = cls(
-            llm_input_size=config["llm_input_size"],
-            device=device,
-            tokenizer_len=tokenizer_len,
-            mem_token_id=config["mem_token_id"],
-            mamba_path=os.path.join(path, "mamba")
-        )
-        
-        model.memory_projection.load_state_dict(
-            torch.load(os.path.join(path, "memory_projection.pt"), 
-                      map_location=device)
-        )
+        try:
+            with open(os.path.join(path, "config.json"), "r") as f:
+                config = json.load(f)
+            
+            model = cls(
+                llm_input_size=config["llm_input_size"],
+                device=device,
+                tokenizer_len=tokenizer_len,
+                mem_token_id=config["mem_token_id"],
+                mamba_path=os.path.join(path, "mamba")
+            )
+            
+            model.memory_projection.load_state_dict(
+                torch.load(os.path.join(path, "memory_projection.pt"), 
+                        map_location=device)
+            )
+        except:
+            raise ValueError("Cannot load model")
         return model
 
 @dataclass 
