@@ -1,0 +1,3 @@
+[submodule "VideoLLaMA2"]
+	path = VideoLLaMA2
+	url = https://github.com/nganngants/VideoLLaMA2-original.git

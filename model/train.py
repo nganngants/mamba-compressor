@@ -1,180 +1,366 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-import argparse
-import json
-import os
-import torch
 import logging
-import h5py
-import tqdm
+import torch
+import numpy as np
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import List, Optional, Tuple
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
+from model.inputs import prepare_input
+from data import ConversationDataset, prepare_single_utterances_data, prepare_multiple_utterances_data
+from dataclasses import dataclass
 
-# Import the necessary modules
-from model import MambaCompressor
-from videollama2 import model_init
+from model.train_videollama import mixup_data
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(message)s',
-    handlers=[logging.StreamHandler()]
-)
 logger = logging.getLogger(__name__)
 
-def load_jsonl(file_path: str) -> List[Dict[str, Any]]:
-    """Load data from a JSONL file"""
-    data = []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            if line.strip():  # Skip empty lines
-                data.append(json.loads(line))
-    return data
+@dataclass
+class TrainingConfig:
+    mamba_path: str
+    train_data: str
+    valid_data: str
+    model_dir: str
+    llm_name: str
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    batch_size_single: int = 8
+    batch_size_conv: int = 1
+    epochs_single: int = 3
+    epochs_conv: int = 2
+    lr_single: float = 2.5e-5
+    lr_conv: float = 1e-4
+    max_length: int = 512
+    end_sym: str = '\n'
+    load_in_4bit: bool = False
+    compute_dtype: str = "float16"
+    quant_type: str = "nf4"
+    use_double_quant: bool = False
+    checkpoint_path: Optional[str] = None
+    
+    # Step-based validation and early stopping
+    eval_steps: int = 50  # Validate every N steps
+    patience_steps: int = 200  # Stop if no improvement after N steps
+    
+    # Traditional epoch-based early stopping (not used with step-based approach)
+    patience: int = 3  
+    
+    # LR scheduler
+    scheduler_type: str = "reduce_on_plateau"  # or "cosine"
+    scheduler_patience: int = 1
+    scheduler_factor: float = 0.5  # Reduce LR by half when plateau is detected
+    scheduler_min_lr: float = 1e-6
+    
+    # Optimization parameters
+    weight_decay: float = 0.01
+    gradient_accumulation_steps: int = 1
+    gradient_clip_value: float = 5.0
+    mixup_alpha: float = 0.0  # Mixup regularization, 0 = disabled
+    warmup_steps: int = 0
 
-def save_jsonl(data: List[Dict[str, Any]], file_path: str):
-    """Save data to a JSONL file"""
-    with open(file_path, 'w', encoding='utf-8') as f:
-        for item in data:
-            f.write(json.dumps(item) + '\n')
+class EarlyStopping:
+    def __init__(self, patience=3, min_delta=0.0, restore_best_weights=True, step_based=False):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.restore_best_weights = restore_best_weights
+        self.counter = 0
+        self.best_loss = np.inf
+        self.best_weights = None
+        self.should_stop = False
+        self.step_based = step_based  # Whether this is step-based or epoch-based
+        self.steps_without_improvement = 0
 
-def process_data(
-    data: List[Dict[str, Any]],
-    mamba_model: MambaCompressor,
-    tokenizer,
-    output_embeds_dir: str,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    batch_size: int = 8
-) -> List[Dict[str, Any]]:
-    """Process data and generate embeddings directly from MambaCompressor"""
-    os.makedirs(output_embeds_dir, exist_ok=True)
-    mamba_model.eval()
-    
-    actual_mamba_model = mamba_model.module if hasattr(mamba_model, 'module') else mamba_model
-    
-    updated_data = []
-    
-    for i in tqdm.tqdm(range(0, len(data), batch_size), desc="Processing batches"):
-        batch = data[i:i+batch_size]
-        
-        history_texts = [sample.get("history_chat_mamba", "") for sample in batch]
-        dialogue_ids = [sample.get("Dialogue_ID", i+idx) for idx, sample in enumerate(batch)]
-        
-        valid_indices = [idx for idx, text in enumerate(history_texts) if text.strip()]
-        if not valid_indices:
-            updated_data.extend(batch)
-            continue
+    def __call__(self, model, current_loss):
+        if current_loss < self.best_loss - self.min_delta:
+            self.best_loss = current_loss
+            self.counter = 0
+            self.steps_without_improvement = 0
+            if self.restore_best_weights:
+                self.best_weights = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            return False
+        else:
+            if self.step_based:
+                self.steps_without_improvement += 1
+                if self.steps_without_improvement >= self.patience:
+                    self.should_stop = True
+                    if self.restore_best_weights and self.best_weights is not None:
+                        model.load_state_dict(self.best_weights)
+                        logger.info("Restoring best weights after step-based early stopping triggered")
+            else:
+                self.counter += 1
+                if self.counter >= self.patience:
+                    self.should_stop = True
+                    if self.restore_best_weights and self.best_weights is not None:
+                        model.load_state_dict(self.best_weights)
+                        logger.info("Restoring best weights after epoch-based early stopping triggered")
             
-        valid_batch = [batch[idx] for idx in valid_indices]
-        valid_texts = [history_texts[idx] for idx in valid_indices]
-        valid_dialogue_ids = [dialogue_ids[idx] for idx in valid_indices]
+        return self.should_stop
+
+def train_epoch(model,
+                llm: AutoModelForCausalLM,
+                tokenizer: AutoTokenizer,
+                train_loader: DataLoader,
+                val_loader: DataLoader,
+                optimizer: torch.optim.Optimizer,
+                scheduler,
+                system_prompt: str,
+                config: TrainingConfig,
+                early_stopping=None) -> Tuple[float, bool]:
+    
+    model.train()
+    total_loss = 0
+    progress_bar = tqdm(train_loader, desc="Training")
+    
+    global_step = 0
+    stop_training = False
+    best_val_loss = float('inf')
+    
+    for i, batch in enumerate(progress_bar):
+        try:
+            input_data = prepare_input(
+                mamba_model=model,
+                llm_model=llm,
+                llm_tokenizer=tokenizer,
+                system_prompt=system_prompt,
+                input_texts=batch['input_text'],
+                device=model.device,
+                end_sym=config.end_sym
+            )
+            
+            
+            llm_outputs = llm(
+                inputs_embeds=input_data['input_embeds'],
+                attention_mask=input_data['attention_mask'],
+                labels=input_data['labels'],
+                return_dict=True
+            )
+            
+            loss = llm_outputs.loss
+            
+            model.backward(loss)
+            
+            model.step()
+            
+            # Log the actual loss value (not the scaled one)
+            batch_loss = loss.item()
+            total_loss += batch_loss
+            progress_bar.set_postfix({'loss': batch_loss, 'step': global_step})
+            global_step += 1
+
+            if config.eval_steps > 0 and global_step % config.eval_steps == 0:
+                val_loss = validate(model, llm, tokenizer, val_loader, system_prompt, config)
+                model.train()
+                
+                if early_stopping is not None and early_stopping(model, val_loss):
+                    stop_training = True
+                    break
+            
+            del input_data, llm_outputs
+            torch.cuda.empty_cache()
+            
+        except RuntimeError as e:
+            logger.error(f"Error during forward pass: {e}")
+            torch.cuda.empty_cache()
+            continue
         
-        with torch.no_grad():
+        if stop_training:
+            break
+    
+    avg_loss = total_loss / len(train_loader)
+        
+    return avg_loss, stop_training
+
+def validate(model,
+            llm: AutoModelForCausalLM,
+            tokenizer: AutoTokenizer,
+            val_loader: DataLoader,
+            system_prompt: str,
+            config: TrainingConfig) -> float:
+    
+    model.eval()
+    total_loss = 0
+    
+    progress_bar = tqdm(val_loader, desc="Validating")
+    
+    with torch.no_grad():
+        for batch in progress_bar:
             try:
-                input_ids = tokenizer(
-                    valid_texts,
-                    padding=True,
-                    truncation=True,
-                    return_tensors='pt',
-                    max_length=512
-                ).to(device)
+                input_data = prepare_input(
+                    mamba_model=model,
+                    llm_model=llm,
+                    llm_tokenizer=tokenizer,
+                    system_prompt=system_prompt,
+                    input_texts=batch['input_text'],
+                    device=model.device,
+                    end_sym=config.end_sym
+                )
                 
-                memory_features = actual_mamba_model(input_ids)
+                llm_outputs = llm(
+                    inputs_embeds=input_data['input_embeds'],
+                    attention_mask=input_data['attention_mask'],
+                    labels=input_data['labels'],
+                    return_dict=True
+                )
                 
-                for idx, (sample, dialogue_id) in enumerate(zip(valid_batch, valid_dialogue_ids)):
-                    sample_idx = i + valid_indices[idx]
-                    embeds_filename = f"hist_embeds_{dialogue_id}_{sample_idx}.h5"
-                    embeds_path = os.path.join(output_embeds_dir, embeds_filename)
-                    
-                    sample_embeds = memory_features[idx].detach().cpu().numpy()
-                    
-                    with h5py.File(embeds_path, 'w') as f:
-                        f.create_dataset('input_embeds', data=sample_embeds)
-                    
-                    sample['history_embeds_path'] = embeds_path
-                    updated_data.append(sample)
+                batch_loss = llm_outputs.loss.item()
+                total_loss += batch_loss
+                progress_bar.set_postfix({'val_loss': batch_loss})
                 
-            except Exception as e:
-                logger.error(f"Error processing batch starting at index {i}: {str(e)}")
-                for idx, sample in enumerate(batch):
-                    if idx in valid_indices:
-                        logger.warning(f"Skipping sample {i+idx} due to processing error")
-                    updated_data.append(sample)
+                del input_data, llm_outputs
+                torch.cuda.empty_cache()
+                
+            except RuntimeError as e:
+                logger.error(f"Error during validation: {e}")
+                torch.cuda.empty_cache()
                 continue
+    
+    return total_loss / len(val_loader)
+
+def get_scheduler(scheduler_type, optimizer, patience, factor, min_lr, t_max=None):
+    """Returns the appropriate learning rate scheduler based on config"""
+    if scheduler_type == "reduce_on_plateau":
+        return ReduceLROnPlateau(
+            optimizer, 
+            mode='min', 
+            factor=factor,
+            patience=patience, 
+            verbose=True,
+            min_lr=min_lr
+        )
+    elif scheduler_type == "cosine":
+        return CosineAnnealingLR(
+            optimizer,
+            T_max=t_max if t_max is not None else 10,
+            eta_min=min_lr
+        )
+    else:
+        logger.warning(f"Unknown scheduler type: {scheduler_type}. No scheduler will be used.")
+        return None
+
+def train_single_utterance(config: TrainingConfig,
+                         llm: AutoModelForCausalLM,
+                         tokenizer: AutoTokenizer,
+                         model_dir: str,
+                         model):
+    
+    print("Training single utterances")
+    train_data = prepare_single_utterances_data(config.train_data)
+    valid_data = prepare_single_utterances_data(config.valid_data)
+    
+    if model is None:
+        raise ValueError("Model is None")
+    
+    train_dataset = ConversationDataset(train_data, tokenizer)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size_single, shuffle=True)
+    val_dataset = ConversationDataset(valid_data, tokenizer)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size_single)
+    
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=config.lr_single,
+        weight_decay=config.weight_decay
+    )
+    
+    # Get the appropriate scheduler
+    scheduler = get_scheduler(
+        config.scheduler_type,
+        optimizer,
+        config.scheduler_patience,
+        config.scheduler_factor,
+        config.scheduler_min_lr,
+        t_max=config.epochs_single * len(train_loader)
+    )
+    
+    system_prompt = "You are a helpful assistant. Provided the compressed embeddings, please reconstruct the conversation."
+    
+    # Initialize early stopping
+    # If we have step-based early stopping configured, use that
+    if config.eval_steps > 0 and config.patience_steps > 0:
+        early_stopping = EarlyStopping(
+            patience=config.patience_steps, 
+            restore_best_weights=True,
+            step_based=True
+        )
+        logger.info(f"Using step-based early stopping with patience of {config.patience_steps} steps")
+    else:
+        # Otherwise fall back to epoch-based early stopping
+        early_stopping = EarlyStopping(
+            patience=config.patience, 
+            restore_best_weights=True,
+            step_based=False
+        )
+        logger.info(f"Using epoch-based early stopping with patience of {config.patience} epochs")
+    
+    best_val_loss = float('inf')
+    
+    for epoch in range(config.epochs_single):
+        # If using step-based validation, we pass the validation loader and early stopping to train_epoch
+        if config.eval_steps > 0:
+            train_loss, stop_training = train_epoch(
+                model, llm, tokenizer, train_loader, val_loader, optimizer, scheduler, system_prompt, config, early_stopping
+            )
+            logging.info(f'Epoch {epoch+1} completed - Train loss: {train_loss:.4f}, LR: {optimizer.param_groups[0]["lr"]}')
+            
+            if stop_training:
+                logging.info(f"Early stopping triggered during epoch {epoch+1}")
+                break
+        else:
+            # Traditional epoch-based approach
+            train_loss, _ = train_epoch(
+                model, llm, tokenizer, train_loader, None, optimizer, scheduler, system_prompt, config
+            )
+            val_loss = validate(model, llm, tokenizer, val_loader, system_prompt, config)
+            
+            logging.info(f"Epoch {epoch+1} - Train loss: {train_loss:.4f}, Val loss: {val_loss:.4f}")
+            
+            # Save checkpoint if it's the best model so far
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                model.save_pretrained(f"{model_dir}_best")
+                logging.info(f"Saved best model with validation loss: {val_loss:.4f}")
+            
+            # Early stopping check for epoch-based
+            if early_stopping(model, val_loss):
+                logging.info(f"Early stopping triggered after epoch {epoch+1}")
+                break
+    
+    # Final save
+    model.save_pretrained(model_dir)
+    return model
+
+def train_conversations(config: TrainingConfig,
+                       llm: AutoModelForCausalLM,
+                       tokenizer: AutoTokenizer,
+                       model,
+                       model_dir: str):
+    print("Training multiple utterances")
+    train_data = prepare_multiple_utterances_data(config.train_data)
+    valid_data = prepare_multiple_utterances_data(config.valid_data)
+    
+    train_dataset = ConversationDataset(train_data, tokenizer)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size_conv, shuffle=True)
+    val_dataset = ConversationDataset(valid_data, tokenizer)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size_conv)
+    
+    system_prompt = "You are a helpful assistant. Provided the compressed embeddings, please reconstruct the conversation."
+    
+    # Initialize early stopping
+    
+    best_val_loss = float('inf')
+
+    for epoch in range(config.epochs_conv):
+        train_loss = train_epoch(
+            model, llm, tokenizer, train_loader, val_loader, optimizer, scheduler, system_prompt, config
+        )
+        val_loss = validate(model, llm, tokenizer, val_loader, system_prompt, config)
         
-        for idx, sample in enumerate(batch):
-            if idx not in valid_indices:
-                updated_data.append(sample)
+        logging.info(f'Epoch {epoch+1} - Train loss: {train_loss:.4f}, Val loss: {val_loss:.4f}')
+        
+        # Save checkpoint if it's the best model so far
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            model.module.save_pretrained(f"{model_dir}_best")
+            model.save_checkpoint(f"{model_dir}_engine_best", tag="best_model")
+            logging.info(f"Saved best model with validation loss: {val_loss:.4f}")
     
-    return updated_data
-
-def main():
-    parser = argparse.ArgumentParser(description="Generate and save embeddings from MambaCompressor")
-    parser.add_argument("--input_jsonl", type=str, required=True, help="Path to input JSONL file")
-    parser.add_argument("--output_jsonl", type=str, required=True, help="Path to output JSONL file")
-    parser.add_argument("--output_embeds_dir", type=str, required=True, help="Directory to save embedding H5PY files")
-    parser.add_argument("--mamba_model_path", type=str, required=True, help="Path to trained MambaCompressor model")
-    parser.add_argument("--llm_name", type=str, required=True, help="Name or path of the LLM model (for tokenizer only)")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for processing")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", 
-                        help="Device to run on (cuda/cpu)")
-    args = parser.parse_args()
-    
-    # Create output directories if they don't exist
-    os.makedirs(os.path.dirname(args.output_jsonl), exist_ok=True)
-    os.makedirs(args.output_embeds_dir, exist_ok=True)
-    
-    # Load LLM and tokenizer (only need tokenizer)
-    logger.info(f"Loading tokenizer from: {args.llm_name}")
-    _, _, tokenizer = model_init(args.llm_name)
-    
-    # Add special tokens to the tokenizer
-    tokenizer.add_special_tokens(
-        {'additional_special_tokens': 
-            [
-                '<|im_start|>', 
-                '<|im_end|>',
-                '<history>',
-                '<video>',
-                '<MEM>'
-            ]
-        }
-    )
-    
-    # Get memory token ID
-    mem_token_id = tokenizer.convert_tokens_to_ids('<MEM>')
-    
-    # Load MambaCompressor
-    logger.info(f"Loading MambaCompressor from: {args.mamba_model_path}")
-    mamba_model = MambaCompressor.from_pretrained(
-        path=args.mamba_model_path,
-        device=args.device,
-        tokenizer_len=len(tokenizer),
-        mem_token_id=mem_token_id
-    ).to(args.device)
-    
-    # Load input data
-    logger.info(f"Loading data from: {args.input_jsonl}")
-    data = load_jsonl(args.input_jsonl)
-    logger.info(f"Loaded {len(data)} samples")
-    
-    # Process data
-    logger.info("Processing data through MambaCompressor")
-    updated_data = process_data(
-        data=data,
-        mamba_model=mamba_model,
-        tokenizer=tokenizer,
-        output_embeds_dir=args.output_embeds_dir,
-        device=args.device,
-        batch_size=args.batch_size
-    )
-    
-    # Save updated data
-    logger.info(f"Saving processed data to: {args.output_jsonl}")
-    save_jsonl(updated_data, args.output_jsonl)
-    logger.info(f"Saved {len(updated_data)} samples with embedding paths")
-    
-    logger.info("Processing complete!")
-
-if __name__ == "__main__":
-    main()
+    # Final save
+    model.save_pretrained(model_dir)
