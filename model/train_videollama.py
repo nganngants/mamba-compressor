@@ -46,8 +46,19 @@ def find_all_linear_names(model):
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
 
+
 def load_llm_and_tokenizer(config: TrainingConfig):
-    model, _, tokenizer = model_init(config.llm_name)
+    # Initialize model with 4-bit quantization
+    model, _, tokenizer = model_init(
+        config.llm_name,
+        load_4bit=True,  # Enable 4-bit quantization
+        device_map="auto",
+        device="cuda",
+        # BitsAndBytes configuration is handled internally by load_pretrained_model
+    )
+
+    for param in model.parameters():
+        param.requires_grad = False
     
     # Add LoRA config
     lora_config = LoraConfig(
@@ -56,7 +67,12 @@ def load_llm_and_tokenizer(config: TrainingConfig):
         target_modules=find_all_linear_names(model),
         lora_dropout=config.lora_dropout,
         bias="none",
-        task_type="CAUSAL_LM"
+        task_type="CAUSAL_LM",
+        # QLoRA specific settings
+        use_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True
     )
     
     # Convert to LoRA
@@ -66,10 +82,13 @@ def load_llm_and_tokenizer(config: TrainingConfig):
     tokenizer.add_special_tokens({
         'additional_special_tokens': ['<|im_start|>', '<|im_end|>', '<history>', '<video>', '<MEM>']
     })
-
-    for param in model.parameters():
-        param.requires_grad = False
-
+    
+    # Enable gradient checkpointing for memory efficiency
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    
+    model.config.use_cache = False  # Required for gradient checkpointing
+    
     return model, tokenizer
 
 
