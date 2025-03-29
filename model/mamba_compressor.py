@@ -41,9 +41,12 @@ class MambaCompressor(nn.Module):
 
     def forward(self, input_ids):
         outputs = self.mamba(input_ids["input_ids"].to(self.device)).last_hidden_state
-     
+        
+        # Get model dtype to ensure consistency
+        model_dtype = outputs.dtype
+        
         mem_token_mask = input_ids["input_ids"] == self.mem_token_id
-       
+    
         batch_indices = torch.arange(outputs.size(0), device=outputs.device)[:, None]
         mem_positions = mem_token_mask.nonzero()
         batch_nums = mem_positions[:, 0]
@@ -66,6 +69,14 @@ class MambaCompressor(nn.Module):
         
         memory_features = torch.stack(memory_features)
 
+        # print(f"DEBUG: memory_features dtype before projection: {memory_features.dtype}")
+        # print(f"DEBUG: memory_projection weight dtype: {self.memory_projection.weight.dtype}")
+        
+        # Absolutely ensure the memory_features has the same dtype as the projection layer
+        if memory_features.dtype != self.memory_projection.weight.dtype:
+            # print(f"WARNING: Forcing dtype conversion from {memory_features.dtype} to {self.memory_projection.weight.dtype}")
+            memory_features = memory_features.to(dtype=self.memory_projection.weight.dtype)
+        # Apply memory projection and ensure dtype consistency
         outputs = self.memory_projection(memory_features)
         
         return outputs
