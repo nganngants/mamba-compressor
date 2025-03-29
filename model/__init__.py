@@ -1,1 +1,1 @@
-from .mamba_compressor import MambaCompressor, LLMConfig
+from .mamba_compressor import MambaCompressor

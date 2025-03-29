@@ -58,6 +58,10 @@ class TrainingConfig:
     local_rank: int = -1
     deepspeed: str = "ds_config.json"
 
+    lora_r: int = 32
+    lora_alpha: int = 64
+    lora_dropout: float = 0.05
+
 
 def mixup_data(input_embeds, labels, alpha=1.0, device='cuda'):
     """Applies mixup augmentation to the embeddings"""
@@ -67,7 +71,7 @@ def mixup_data(input_embeds, labels, alpha=1.0, device='cuda'):
         lam = 1
     
     batch_size = input_embeds.size(0)
-    index = torch.randperm(batch_size).to(device)
+    index = torch.randperm(batch_size)
     
     mixed_input_embeds = lam * input_embeds + (1 - lam) * input_embeds[index, :]
     return mixed_input_embeds, labels, labels[index], lam

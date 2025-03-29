@@ -107,16 +107,3 @@ class MambaCompressor(nn.Module):
         except:
             raise ValueError("Cannot load model")
         return model
-
-@dataclass 
-class LLMConfig:
-   model_name: str
-   device: str = "cuda" if torch.cuda.is_available() else "cpu"
-   load_in_4bit: bool = True
-   compute_dtype: torch.dtype = torch.float16
-   quant_type: str = "nf4"
-   use_double_quant: bool = True
-
-   lora_r: int = 32
-   lora_alpha: int = 64
-   lora_dropout: float = 0.05

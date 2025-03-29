@@ -18,5 +18,5 @@ deepspeed --num_gpus=4 \
     --patience_steps 2 \
     --gradient_accumulation_steps 1 \
     --scheduler_type reduce_on_plateau \
-    --lora_r 32 \
-    --lora_alpha 64 
+    --lora_r 4 \
+    --lora_alpha 8 

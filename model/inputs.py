@@ -18,14 +18,14 @@ def prepare_input(
         # padding=True,
         truncation=True,
         return_tensors='pt',
-        max_length=1024
-    ).to(device)
+        max_length=100
+    )
 
-    memory_features = mamba_model(input_ids).to(torch.float16)
+    memory_features = mamba_model(input_ids)
     atts_memory = torch.ones(
         (memory_features.size(0), memory_features.size(1)),
         dtype=torch.long,
-    ).to(device)
+    )
     
     # Combine system prompt with memory features
     system_encodings = llm_tokenizer(
@@ -33,8 +33,8 @@ def prepare_input(
         padding=True,
         truncation=True,
         return_tensors='pt',
-        max_length=64
-    ).to(device)
+        max_length=16
+    )
     system_embeds = llm_model.model.embed_tokens(system_encodings['input_ids']) # (batch, seq, hidden)
     
     memory_features = torch.cat([system_embeds, memory_features], dim=1)
@@ -46,14 +46,14 @@ def prepare_input(
         target_texts,
         truncation=True,
         return_tensors="pt",
-        max_length=1024,
-    ).to(device)
+        max_length=100,
+    )
     targets = to_regress_tokens.input_ids.masked_fill(
                 to_regress_tokens.input_ids == llm_tokenizer.pad_token_id, -100
             )
     empty_targets = (
                 torch.ones([memory_features.shape[0], memory_features.shape[1]],
-                        dtype=torch.long).to(device).fill_(-100)
+                        dtype=torch.long).fill_(-100)
             )
     targets = torch.cat([empty_targets, targets], dim=1)
 
@@ -64,5 +64,5 @@ def prepare_input(
     return {
         'input_embeds': input_embeds,
         'attention_mask': attention_mask,
-        'labels': targets
+        'labels': targets,
     }

@@ -13,6 +13,7 @@ from model import MambaCompressor
 import os
 from model.train import train_single_utterance, train_conversations
 from peft import LoraConfig, get_peft_model
+from transformers import BitsAndBytesConfig
 
 logger = logging.getLogger(__name__)
 
@@ -46,19 +47,43 @@ def find_all_linear_names(model):
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
 
-
 def load_llm_and_tokenizer(config: TrainingConfig):
-    # Initialize model with 4-bit quantization
+    # First load model in fp16
     model, _, tokenizer = model_init(
         config.llm_name,
-        load_4bit=True,  # Enable 4-bit quantization
-        device_map="auto",
-        device="cuda",
-        # BitsAndBytes configuration is handled internally by load_pretrained_model
     )
-
-    for param in model.parameters():
-        param.requires_grad = False
+    
+    # Manual 4-bit quantization after loading
+    from bitsandbytes.nn import Linear4bit, Params4bit
+    import torch.nn as nn
+    
+    def convert_to_4bit(model):
+        """Convert Linear layers to 4-bit"""
+        # First collect all modules to convert
+        modules_to_convert = []
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear) and 'lm_head' not in name:
+                modules_to_convert.append((name, module))
+        
+        # Then convert each module
+        for name, module in modules_to_convert:
+            parent_name = '.'.join(name.split('.')[:-1])
+            child_name = name.split('.')[-1]
+            parent_module = model if parent_name == '' else model.get_submodule(parent_name)
+            
+            new_module = Linear4bit(
+                module.in_features,
+                module.out_features,
+                bias=module.bias is not None,
+                compress_statistics=True,
+                quant_type='nf4'
+            )
+            setattr(parent_module, child_name, new_module)
+            
+        return model
+    
+    # Convert model to 4-bit
+    model = convert_to_4bit(model)
     
     # Add LoRA config
     lora_config = LoraConfig(
@@ -67,30 +92,24 @@ def load_llm_and_tokenizer(config: TrainingConfig):
         target_modules=find_all_linear_names(model),
         lora_dropout=config.lora_dropout,
         bias="none",
-        task_type="CAUSAL_LM",
-        # QLoRA specific settings
-        use_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True
+        task_type="CAUSAL_LM"
     )
     
     # Convert to LoRA
     model = get_peft_model(model, lora_config)
     
+    model = model.half()
+
     # Add special tokens
     tokenizer.add_special_tokens({
         'additional_special_tokens': ['<|im_start|>', '<|im_end|>', '<history>', '<video>', '<MEM>']
     })
-    
-    # Enable gradient checkpointing for memory efficiency
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
-    
-    model.config.use_cache = False  # Required for gradient checkpointing
-    
-    return model, tokenizer
 
+    for param in model.parameters():
+        param.requires_grad = False
+
+
+    return model, tokenizer
 
 def main():
     parser = argparse.ArgumentParser()
@@ -150,7 +169,7 @@ def main():
     setup_logging(Path(config.model_dir))
     
     llm, tokenizer = load_llm_and_tokenizer(config)
-    
+
     model = None
     # TODO: load model from deepspeed checkpoint
     # if config.checkpoint_path is not None:
@@ -183,6 +202,8 @@ def main():
                                             device=f"cuda:{local_rank}" if local_rank != -1 else "cuda",
                                             tokenizer_len=len(tokenizer)
                 )
+
+    model = model.half()
 
     model_engine, optimizer, _, _ = deepspeed.initialize(
         model=model,
