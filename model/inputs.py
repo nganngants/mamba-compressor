@@ -41,7 +41,7 @@ def prepare_input(
         return_tensors='pt',
         max_length=16
     )
-    system_embeds = llm_model.model.embed_tokens(system_encodings['input_ids'].to(device)) # (batch, seq, hidden)
+    system_embeds = llm_model.get_input_embeddings(system_encodings['input_ids'].to(device)) # (batch, seq, hidden)
     
     # Ensure consistent dtype
     system_embeds = system_embeds.to(dtype=model_dtype)
