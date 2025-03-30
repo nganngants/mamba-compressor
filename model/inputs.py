@@ -18,8 +18,11 @@ def prepare_input(
         # padding=True,
         truncation=True,
         return_tensors='pt',
-        max_length=100
+        max_length=32
     )
+
+    mamba_device = mamba_model.mamba.parameters().__next__().device
+    llm_model.to(device)
     
     # Get the model dtype from the LLM model
     model_dtype = next(llm_model.parameters()).dtype
@@ -39,9 +42,14 @@ def prepare_input(
         padding=True,
         truncation=True,
         return_tensors='pt',
-        max_length=16
+        max_length=4
     )
-    system_embeds = llm_model.get_input_embeddings(system_encodings['input_ids'].to(device)) # (batch, seq, hidden)
+    system_embeds = llm_model.get_input_embeddings()(system_encodings['input_ids']) # (batch, seq, hidden)
+
+    print(f"DEBUG device: {llm_model.device}")
+    print(f"DEBUG system_embeds: {system_embeds.device}")
+    print(f"DEBUG memory_features: {memory_features.device}")
+
     
     # Ensure consistent dtype
     system_embeds = system_embeds.to(dtype=model_dtype)
@@ -55,7 +63,7 @@ def prepare_input(
         target_texts,
         truncation=True,
         return_tensors="pt",
-        max_length=100,
+        max_length=32,
     )
     targets = to_regress_tokens.input_ids.masked_fill(
                 to_regress_tokens.input_ids == llm_tokenizer.pad_token_id, -100
@@ -66,7 +74,7 @@ def prepare_input(
             )
     targets = torch.cat([empty_targets, targets], dim=1)
 
-    to_regress_embeds = llm_model.model.embed_tokens(to_regress_tokens.input_ids.to(device))
+    to_regress_embeds = llm_model.get_input_embeddings()(to_regress_tokens.input_ids)
     
     # Ensure consistent dtype
     to_regress_embeds = to_regress_embeds.to(dtype=model_dtype)

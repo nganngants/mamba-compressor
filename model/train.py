@@ -134,52 +134,48 @@ def train_epoch(model,
     best_val_loss = float('inf')
     
     for i, batch in enumerate(progress_bar):
-        try:
-            input_data = prepare_input(
-                mamba_model=model,
-                llm_model=llm,
-                llm_tokenizer=tokenizer,
-                system_prompt=system_prompt,
-                input_texts=batch['input_text'],
-                device=model.device,
-                end_sym=config.end_sym
-            )
-            
-            
-            llm_outputs = llm(
-                inputs_embeds=input_data['input_embeds'],
-                attention_mask=input_data['attention_mask'],
-                labels=input_data['labels'],
-                return_dict=True
-            )
-            
-            loss = llm_outputs.loss
-            
-            model.backward(loss)
-            
-            model.step()
-            
-            # Log the actual loss value (not the scaled one)
-            batch_loss = loss.item()
-            total_loss += batch_loss
-            progress_bar.set_postfix({'loss': batch_loss, 'step': global_step})
-            global_step += 1
+        input_data = prepare_input(
+            mamba_model=model,
+            llm_model=llm,
+            llm_tokenizer=tokenizer,
+            system_prompt=system_prompt,
+            input_texts=batch['input_text'],
+            device=model.device,
+            end_sym=config.end_sym
+        )
+        
+        print(f"DEBUG: LLM model device: {next(llm.parameters()).device}")
+        llm_device = next(llm.parameters()).device
+        llm_outputs = llm(
+            inputs_embeds=input_data['input_embeds'].to(llm_device),
+            attention_mask=input_data['attention_mask'].to(llm_device),
+            labels=input_data['labels'].to(llm_device),
+            return_dict=True
+        )
+        
+        loss = llm_outputs.loss
+        
+        model.backward(loss)
+        
+        model.step()
+        
+        # Log the actual loss value (not the scaled one)
+        batch_loss = loss.item()
+        total_loss += batch_loss
+        progress_bar.set_postfix({'loss': batch_loss, 'step': global_step})
+        global_step += 1
 
-            if config.eval_steps > 0 and global_step % config.eval_steps == 0:
-                val_loss = validate(model, llm, tokenizer, val_loader, system_prompt, config)
-                model.train()
-                
-                if early_stopping is not None and early_stopping(model, val_loss):
-                    stop_training = True
-                    break
+        if config.eval_steps > 0 and global_step % config.eval_steps == 0:
+            val_loss = validate(model, llm, tokenizer, val_loader, system_prompt, config)
+            model.train()
             
-            del input_data, llm_outputs
-            torch.cuda.empty_cache()
+            if early_stopping is not None and early_stopping(model, val_loss):
+                stop_training = True
+                break
+        
+        del input_data, llm_outputs
+        torch.cuda.empty_cache()
             
-        except RuntimeError as e:
-            logger.error(f"Error during forward pass: {e}")
-            torch.cuda.empty_cache()
-            continue
         
         if stop_training:
             break

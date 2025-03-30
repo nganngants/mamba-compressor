@@ -1,6 +1,6 @@
 #!/bin/bash
 
-deepspeed --num_gpus=4 \
+deepspeed --num_gpus=2 \
     model/train_videollama.py \
     --deepspeed ds_config.json \
     --mamba_path "state-spaces/mamba-370m-hf" \
