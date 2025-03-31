@@ -30,6 +30,7 @@ def prepare_input(
     # Get memory features from mamba model and ensure it's in the correct dtype
     memory_features = mamba_model(input_ids)
     memory_features = memory_features.to(dtype=model_dtype)
+    memory_features = memory_features.to(device)
     
     atts_memory = torch.ones(
         (memory_features.size(0), memory_features.size(1)),
@@ -44,14 +45,8 @@ def prepare_input(
         return_tensors='pt',
         max_length=4
     )
-    system_embeds = llm_model.get_input_embeddings()(system_encodings['input_ids']) # (batch, seq, hidden)
+    system_embeds = llm_model.get_input_embeddings()(system_encodings['input_ids'].to(device)) # (batch, seq, hidden)
 
-    print(f"DEBUG device: {llm_model.device}")
-    print(f"DEBUG system_embeds: {system_embeds.device}")
-    print(f"DEBUG memory_features: {memory_features.device}")
-
-    
-    # Ensure consistent dtype
     system_embeds = system_embeds.to(dtype=model_dtype)
     
     memory_features = torch.cat([system_embeds, memory_features], dim=1)
