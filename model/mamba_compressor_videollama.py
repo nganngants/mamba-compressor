@@ -44,15 +44,27 @@ class MambaCompressor(nn.Module):
         
         mamba_hidden = self.mamba.config.hidden_size
         self.memory_projection = nn.Linear(mamba_hidden, llm_input_size)
-        self.device = device
 
         self.llm_model = llm_model
         self.llm_toekenizer = llm_tokenizer
 
+        self.llm_model.to("cuda")
+        self.llm_tokenizer.to("cuda")
+
         self.system_prompt = "You are a helpful assistant. Please help to reconstruct the original chat history from this compressed history embedding: "
         self.end_sym = "\n"
     
-    def forward(self, input_ids, max_length=512):
+    def forward(self, input_texts, max_length=512):
+
+        input_ids = self.llm_tokenizer(
+            input_texts,
+            # padding=True,
+            truncation=True,
+            return_tensors='pt',
+            max_length=max_length
+        )
+
+        input_ids["input_ids"] = input_ids["input_ids"].to("cuda")
 
         outputs = self.mamba(input_ids["input_ids"]).last_hidden_state
         
@@ -75,7 +87,7 @@ class MambaCompressor(nn.Module):
         for i, mem in enumerate(memory_features):
             if len(mem) < max_seq_len:
                 pad_len = max_seq_len - len(mem)
-                memory_features[i] = torch.cat([mem, torch.zeros(pad_len, mem.size(-1), device=mem.device)], dim=0)
+                memory_features[i] = torch.cat([mem, torch.zeros(pad_len, mem.size(-1))], dim=0)
         
         memory_features = torch.stack(memory_features)
         if memory_features.dtype != self.memory_projection.weight.dtype:
@@ -111,7 +123,7 @@ class MambaCompressor(nn.Module):
             return_tensors='pt',
             max_length=16
         )
-        system_embeds = self.llm_model.get_input_embeddings()(system_encodings['input_ids'].to(self.device)) # (batch, seq, hidden)
+        system_embeds = self.llm_model.get_input_embeddings()(system_encodings['input_ids']) # (batch, seq, hidden)
 
         memory_features = torch.cat([system_embeds, memory_features], dim=1)
         atts_memory = atts_memory[:, :1].expand(-1, memory_features.size(1))
@@ -144,7 +156,6 @@ class MambaCompressor(nn.Module):
         config = {
             "llm_input_size": self.memory_projection.out_features,
             "mamba_hidden_size": self.mamba.config.hidden_size,
-            "device": self.device,
             "mem_token_id": self.mem_token_id
         }
         

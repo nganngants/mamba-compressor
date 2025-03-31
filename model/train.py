@@ -130,17 +130,12 @@ def train_epoch(model,
     global_step = 0
     stop_training = False
     best_val_loss = float('inf')
+
+    model.to("cuda")
     
     for i, batch in enumerate(progress_bar):
-        input_ids = tokenizer(
-            batch["input_texts"],
-            # padding=True,
-            truncation=True,
-            return_tensors='pt',
-            max_length=config.max_length
-        )
         
-        llm_outputs = model(input_ids)
+        llm_outputs = model(batch["input_text"])
         
         loss = llm_outputs.loss
         
@@ -186,15 +181,7 @@ def validate(model,
     with torch.no_grad():
         for batch in progress_bar:
             try:
-                input_ids = tokenizer(
-                    batch["input_texts"],
-                    # padding=True,
-                    truncation=True,
-                    return_tensors='pt',
-                    max_length=config.max_length
-                )
-                
-                llm_outputs = model(input_ids)
+                llm_outputs = model(batch["input_text"])
                 
                 batch_loss = llm_outputs.loss.item()
                 total_loss += batch_loss
@@ -323,8 +310,7 @@ def train_single_utterance(config: TrainingConfig,
     return model
 
 def train_conversations(config: TrainingConfig,
-                       llm: AutoModelForCausalLM,
-                       tokenizer: AutoTokenizer,
+                       tokenizer,
                        model,
                        model_dir: str):
     print("Training multiple utterances")
@@ -335,18 +321,16 @@ def train_conversations(config: TrainingConfig,
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size_conv, shuffle=True)
     val_dataset = ConversationDataset(valid_data, tokenizer)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size_conv)
-    
-    system_prompt = "You are a helpful assistant. Provided the compressed embeddings, please reconstruct the conversation."
-    
+        
     # Initialize early stopping
     
     best_val_loss = float('inf')
 
     for epoch in range(config.epochs_conv):
         train_loss = train_epoch(
-            model, llm, tokenizer, train_loader, val_loader, system_prompt, config
+            model, tokenizer, train_loader, val_loader, config
         )
-        val_loss = validate(model, llm, tokenizer, val_loader, system_prompt, config)
+        val_loss = validate(model, tokenizer, val_loader, system_prompt, config)
         
         logging.info(f'Epoch {epoch+1} - Train loss: {train_loss:.4f}, Val loss: {val_loss:.4f}')
         

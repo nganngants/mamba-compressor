@@ -215,6 +215,7 @@ def main():
 
     model = model_engine
     
+    model.to("cuda")
     train_conversations(
         config=config,
         tokenizer=tokenizer,
