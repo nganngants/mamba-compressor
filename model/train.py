@@ -117,11 +117,9 @@ class EarlyStopping:
         return self.should_stop
 
 def train_epoch(model,
-                llm: AutoModelForCausalLM,
                 tokenizer: AutoTokenizer,
                 train_loader: DataLoader,
                 val_loader: DataLoader,
-                system_prompt: str,
                 config: TrainingConfig,
                 early_stopping=None) -> Tuple[float, bool]:
     
@@ -134,24 +132,15 @@ def train_epoch(model,
     best_val_loss = float('inf')
     
     for i, batch in enumerate(progress_bar):
-        input_data = prepare_input(
-            mamba_model=model,
-            llm_model=llm,
-            llm_tokenizer=tokenizer,
-            system_prompt=system_prompt,
-            input_texts=batch['input_text'],
-            device=model.device,
-            end_sym=config.end_sym
+        input_ids = tokenizer(
+            batch["input_texts"],
+            # padding=True,
+            truncation=True,
+            return_tensors='pt',
+            max_length=config.max_length
         )
         
-        print(f"DEBUG: LLM model device: {next(llm.parameters()).device}")
-        llm_device = next(llm.parameters()).device
-        llm_outputs = llm(
-            inputs_embeds=input_data['input_embeds'].to(llm_device),
-            attention_mask=input_data['attention_mask'].to(llm_device),
-            labels=input_data['labels'].to(llm_device),
-            return_dict=True
-        )
+        llm_outputs = model(input_ids)
         
         loss = llm_outputs.loss
         
@@ -166,7 +155,7 @@ def train_epoch(model,
         global_step += 1
 
         if config.eval_steps > 0 and global_step % config.eval_steps == 0:
-            val_loss = validate(model, llm, tokenizer, val_loader, system_prompt, config)
+            val_loss = validate(model, tokenizer, val_loader, config)
             model.train()
             
             if early_stopping is not None and early_stopping(model, val_loss):
@@ -185,10 +174,8 @@ def train_epoch(model,
     return avg_loss, stop_training
 
 def validate(model,
-            llm: AutoModelForCausalLM,
             tokenizer: AutoTokenizer,
             val_loader: DataLoader,
-            system_prompt: str,
             config: TrainingConfig) -> float:
     
     model.eval()
@@ -199,22 +186,15 @@ def validate(model,
     with torch.no_grad():
         for batch in progress_bar:
             try:
-                input_data = prepare_input(
-                    mamba_model=model,
-                    llm_model=llm,
-                    llm_tokenizer=tokenizer,
-                    system_prompt=system_prompt,
-                    input_texts=batch['input_text'],
-                    device=model.device,
-                    end_sym=config.end_sym
+                input_ids = tokenizer(
+                    batch["input_texts"],
+                    # padding=True,
+                    truncation=True,
+                    return_tensors='pt',
+                    max_length=config.max_length
                 )
                 
-                llm_outputs = llm(
-                    inputs_embeds=input_data['input_embeds'],
-                    attention_mask=input_data['attention_mask'],
-                    labels=input_data['labels'],
-                    return_dict=True
-                )
+                llm_outputs = model(input_ids)
                 
                 batch_loss = llm_outputs.loss.item()
                 total_loss += batch_loss

@@ -13,7 +13,6 @@ from model import MambaCompressor
 import os
 from model.train import train_single_utterance, train_conversations
 from peft import LoraConfig, get_peft_model
-from transformers import BitsAndBytesConfig
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +202,10 @@ def main():
                                             tokenizer_len=len(tokenizer)
                 )
 
-    model = model.half()
+    # model = model.half()
+
+    model.llm_model = llm
+    model.llm_tokenizer = tokenizer
 
     model_engine, optimizer, _, _ = deepspeed.initialize(
         model=model,
@@ -215,7 +217,6 @@ def main():
     
     train_conversations(
         config=config,
-        llm=llm,
         tokenizer=tokenizer,
         model=model,
         model_dir=f"{config.model_dir}_stage2"

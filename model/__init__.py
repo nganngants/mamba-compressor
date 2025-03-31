@@ -1,1 +1,1 @@
-from .mamba_compressor import MambaCompressor
+from .mamba_compressor_videollama import MambaCompressor
