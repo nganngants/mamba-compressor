@@ -52,38 +52,6 @@ def load_llm_and_tokenizer(config: TrainingConfig):
         config.llm_name,
     )
     
-    # Manual 4-bit quantization after loading
-    from bitsandbytes.nn import Linear4bit, Params4bit
-    import torch.nn as nn
-    
-    def convert_to_4bit(model):
-        """Convert Linear layers to 4-bit"""
-        # First collect all modules to convert
-        modules_to_convert = []
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Linear) and 'lm_head' not in name:
-                modules_to_convert.append((name, module))
-        
-        # Then convert each module
-        for name, module in modules_to_convert:
-            parent_name = '.'.join(name.split('.')[:-1])
-            child_name = name.split('.')[-1]
-            parent_module = model if parent_name == '' else model.get_submodule(parent_name)
-            
-            new_module = Linear4bit(
-                module.in_features,
-                module.out_features,
-                bias=module.bias is not None,
-                compress_statistics=True,
-                quant_type='nf4'
-            )
-            setattr(parent_module, child_name, new_module)
-            
-        return model
-    
-    # Convert model to 4-bit
-    model = convert_to_4bit(model)
-    
     # Add LoRA config
     lora_config = LoraConfig(
         r=config.lora_r,
