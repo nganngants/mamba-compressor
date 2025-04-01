@@ -48,7 +48,7 @@ class MambaCompressor(nn.Module):
         self.memory_projection = nn.Linear(mamba_hidden, llm_input_size)
 
         self.llm_model = llm_model
-        self.llm_toekenizer = llm_tokenizer
+        self.llm_tokenizer = llm_tokenizer
         
         # if self.
         # self.llm_model.to("cuda")
@@ -99,11 +99,8 @@ class MambaCompressor(nn.Module):
             padding=True,
             truncation=True,
             return_tensors='pt',
-            max_length=16
+            max_length=8
         )
-
-        # print(f"device system encodings: {system_encodings['input_ids'].device}")
-        # print(f"llm model device: {self.llm_model.parameters().__next__().device}")
 
         try:
             system_encodings = system_encodings.to(self.llm_model.parameters().__next__().device)
@@ -112,8 +109,6 @@ class MambaCompressor(nn.Module):
 
         system_embeds = self.llm_model.get_input_embeddings()(system_encodings['input_ids']) # (batch, seq, hidden)
 
-        print(f"system embeds: {system_embeds.shape}")
-        print(f"memory features: {memory_features.shape}")
         memory_features = torch.cat([system_embeds, memory_features], dim=1)
         atts_memory = atts_memory[:, :1].expand(-1, memory_features.size(1))
 
@@ -127,15 +122,12 @@ class MambaCompressor(nn.Module):
                             dtype=torch.long).fill_(-100)
                 ).to(targets.device)
         targets = torch.cat([empty_targets, targets], dim=1)
-        print(f"targets: {targets.device}")
+
         to_regress_embeds = self.llm_model.get_input_embeddings()(to_regress_tokens.input_ids)
 
         input_embeds = torch.cat([memory_features, to_regress_embeds], dim=1)
         attention_mask = torch.cat([atts_memory, to_regress_tokens.attention_mask], dim=1)
 
-        print(input_embeds.dtype)
-        for name, param in self.llm_model.named_parameters():
-            print(f"Parameter {name}: {param.dtype}")
         llm_outputs = self.llm_model(
             inputs_embeds=input_embeds,
             attention_mask=attention_mask,

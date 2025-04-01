@@ -136,7 +136,7 @@ def train_epoch(model,
     for i, batch in enumerate(progress_bar):
         input_ids = tokenizer(
             batch["input_text"],
-            # padding=True,
+            padding=True,
             truncation=True,
             return_tensors='pt',
             max_length=config.max_length
@@ -165,7 +165,7 @@ def train_epoch(model,
         total_loss += batch_loss
         progress_bar.set_postfix({'loss': batch_loss, 'step': i})
 
-        if config.eval_steps > 0 and i % config.eval_steps == 0:
+        if config.eval_steps > 0 and i % config.eval_steps == 0 and i > 0:
             val_loss = validate(model, tokenizer, val_loader, config)
             model.train()
             
@@ -173,7 +173,7 @@ def train_epoch(model,
                 stop_training = True
                 break
         
-        del input_data, llm_outputs
+        del input_ids, llm_outputs
         torch.cuda.empty_cache()
             
         
@@ -199,7 +199,7 @@ def validate(model,
             try:
                 input_ids = tokenizer(
                     batch["input_text"],
-                    # padding=True,
+                    padding=True,
                     truncation=True,
                     return_tensors='pt',
                     max_length=config.max_length
@@ -213,7 +213,7 @@ def validate(model,
                 total_loss += batch_loss
                 progress_bar.set_postfix({'val_loss': batch_loss})
                 
-                del input_data, llm_outputs
+                del input_ids, llm_outputs
                 torch.cuda.empty_cache()
                 
             except RuntimeError as e:

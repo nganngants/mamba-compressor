@@ -37,7 +37,7 @@ def load_llm_and_tokenizer(config: TrainingConfig):
     # First load model in fp16
     model = AutoModelForCausalLM.from_pretrained(
         config.llm_name,
-        device_map="auto",
+        # device_map="auto",
         trust_remote_code=True
     )
     tokenizer = AutoTokenizer.from_pretrained(
@@ -160,7 +160,7 @@ def main():
         tokenizer_len=len(tokenizer),
         mem_token_id=tokenizer.convert_tokens_to_ids('<MEM>'),
         mamba_path=config.mamba_path,
-        llm_model=llm.to("cuda").to(dtype=torch.float16),
+        llm_model=llm,
         llm_tokenizer=tokenizer,
     )
 
