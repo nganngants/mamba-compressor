@@ -46,7 +46,7 @@ class TrainingConfig:
     scheduler_type: str = "reduce_on_plateau"  # or "cosine"
     scheduler_patience: int = 1
     scheduler_factor: float = 0.5  # Reduce LR by half when plateau is detected
-    scheduler_min_lr: float = 1e-6
+    scheduler_min_lr: float = 1e-7
     
     # Optimization parameters
     weight_decay: float = 0.01
@@ -121,6 +121,8 @@ def train_epoch(model,
                 train_loader: DataLoader,
                 val_loader: DataLoader,
                 config: TrainingConfig,
+                optimizer,
+                scheduler=None,
                 early_stopping=None) -> Tuple[float, bool]:
     
     model.train()
@@ -145,18 +147,25 @@ def train_epoch(model,
         llm_outputs = model(input_ids)
         
         loss = llm_outputs.loss
-        
         model.backward(loss)
-        
         model.step()
         
+        # optimizer.zero_grad()
+        # loss.backward()
+
+        # if config.gradient_clip_value > 0:
+        #     torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_value)
+        # optimizer.step()
+        
+        # if scheduler is not None:
+        #     scheduler.step()
+
         # Log the actual loss value (not the scaled one)
         batch_loss = loss.item()
         total_loss += batch_loss
-        progress_bar.set_postfix({'loss': batch_loss, 'step': global_step})
-        global_step += 1
+        progress_bar.set_postfix({'loss': batch_loss, 'step': i})
 
-        if config.eval_steps > 0 and global_step % config.eval_steps == 0:
+        if config.eval_steps > 0 and i % config.eval_steps == 0:
             val_loss = validate(model, tokenizer, val_loader, config)
             model.train()
             
@@ -193,7 +202,7 @@ def validate(model,
                     # padding=True,
                     truncation=True,
                     return_tensors='pt',
-                    max_length=max_length
+                    max_length=config.max_length
                 )
                 
                 input_ids["input_ids"] = input_ids["input_ids"].to("cuda")
@@ -258,19 +267,15 @@ def train_single_utterance(config: TrainingConfig,
         lr=config.lr_single,
         weight_decay=config.weight_decay
     )
-    
-    # Get the appropriate scheduler
+
     scheduler = get_scheduler(
         config.scheduler_type,
         optimizer,
-        config.scheduler_patience,
-        config.scheduler_factor,
-        config.scheduler_min_lr,
-        t_max=config.epochs_single * len(train_loader)
+        patience=config.scheduler_patience,
+        factor=config.scheduler_factor,
+        min_lr=config.scheduler_min_lr
     )
-    
-    system_prompt = "You are a helpful assistant. Provided the compressed embeddings, please reconstruct the conversation."
-    
+        
     # Initialize early stopping
     # If we have step-based early stopping configured, use that
     if config.eval_steps > 0 and config.patience_steps > 0:
@@ -293,34 +298,19 @@ def train_single_utterance(config: TrainingConfig,
     
     for epoch in range(config.epochs_single):
         # If using step-based validation, we pass the validation loader and early stopping to train_epoch
-        if config.eval_steps > 0:
-            train_loss, stop_training = train_epoch(
-                model, llm, tokenizer, train_loader, val_loader, optimizer, scheduler, system_prompt, config, early_stopping
-            )
-            logging.info(f'Epoch {epoch+1} completed - Train loss: {train_loss:.4f}, LR: {optimizer.param_groups[0]["lr"]}')
-            
-            if stop_training:
-                logging.info(f"Early stopping triggered during epoch {epoch+1}")
-                break
-        else:
-            # Traditional epoch-based approach
-            train_loss, _ = train_epoch(
-                model, llm, tokenizer, train_loader, None, optimizer, scheduler, system_prompt, config
-            )
-            val_loss = validate(model, llm, tokenizer, val_loader, system_prompt, config)
-            
-            logging.info(f"Epoch {epoch+1} - Train loss: {train_loss:.4f}, Val loss: {val_loss:.4f}")
-            
-            # Save checkpoint if it's the best model so far
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                model.save_pretrained(f"{model_dir}_best")
-                logging.info(f"Saved best model with validation loss: {val_loss:.4f}")
-            
-            # Early stopping check for epoch-based
-            if early_stopping(model, val_loss):
-                logging.info(f"Early stopping triggered after epoch {epoch+1}")
-                break
+        train_loss = train_epoch(
+            model, tokenizer, train_loader, val_loader, config, optimizer, scheduler, early_stopping
+        )
+        val_loss = validate(model, tokenizer, val_loader, config)
+        
+        logging.info(f'Epoch {epoch+1} - Train loss: {train_loss:.4f}, Val loss: {val_loss:.4f}')
+        
+        # Save checkpoint if it's the best model so far
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            model.module.save_pretrained(f"{model_dir}_best")
+            model.save_checkpoint(f"{model_dir}_engine_best", tag="best_model")
+            logging.info(f"Saved best model with validation loss: {val_loss:.4f}")
     
     # Final save
     model.save_pretrained(model_dir)
@@ -342,12 +332,25 @@ def train_conversations(config: TrainingConfig,
     # Initialize early stopping
     
     best_val_loss = float('inf')
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=config.lr_single,
+        weight_decay=config.weight_decay
+    )
+
+    scheduler = get_scheduler(
+        config.scheduler_type,
+        optimizer,
+        patience=config.scheduler_patience,
+        factor=config.scheduler_factor,
+        min_lr=config.scheduler_min_lr
+    )
 
     for epoch in range(config.epochs_conv):
         train_loss = train_epoch(
-            model, tokenizer, train_loader, val_loader, config
+            model, tokenizer, train_loader, val_loader, config, optimizer, scheduler, None
         )
-        val_loss = validate(model, tokenizer, val_loader, system_prompt, config)
+        val_loss = validate(model, tokenizer, val_loader, config)
         
         logging.info(f'Epoch {epoch+1} - Train loss: {train_loss:.4f}, Val loss: {val_loss:.4f}')
         

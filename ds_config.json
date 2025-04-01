@@ -10,6 +10,22 @@
     "train_micro_batch_size_per_gpu": 1,
     "train_batch_size": 4,
     "gradient_accumulation_steps": 1,
+    "optimizer": {
+    "type": "AdamW",
+        "params": {
+        "lr": 2e-5,
+        "weight_decay": 0.01
+        }
+    },
+    "scheduler": {
+        "type": "WarmupDecayLR",
+        "params": {
+        "total_num_steps": 1000,
+        "warmup_min_lr": 0,
+        "warmup_max_lr": 2e-5,
+        "warmup_num_steps": 100
+        }
+    },
     "zero_optimization": {
         "stage": 3,
         "overlap_comm": true,
