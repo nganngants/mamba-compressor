@@ -204,7 +204,7 @@ def main():
 
     # model = model.half()
 
-    model.llm_model = llm
+    model.llm_model = llm.to("cuda")
     model.llm_tokenizer = tokenizer
 
     model_engine, optimizer, _, _ = deepspeed.initialize(
@@ -216,6 +216,7 @@ def main():
     model = model_engine
     
     model.to("cuda")
+
     train_conversations(
         config=config,
         tokenizer=tokenizer,

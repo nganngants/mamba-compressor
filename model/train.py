@@ -130,12 +130,19 @@ def train_epoch(model,
     global_step = 0
     stop_training = False
     best_val_loss = float('inf')
-
-    model.to("cuda")
     
     for i, batch in enumerate(progress_bar):
+        input_ids = tokenizer(
+            batch["input_text"],
+            # padding=True,
+            truncation=True,
+            return_tensors='pt',
+            max_length=config.max_length
+        )
         
-        llm_outputs = model(batch["input_text"])
+        input_ids["input_ids"] = input_ids["input_ids"].to("cuda")
+        input_ids["attention_mask"] = input_ids["attention_mask"].to("cuda")
+        llm_outputs = model(input_ids)
         
         loss = llm_outputs.loss
         
@@ -181,7 +188,17 @@ def validate(model,
     with torch.no_grad():
         for batch in progress_bar:
             try:
-                llm_outputs = model(batch["input_text"])
+                input_ids = tokenizer(
+                    batch["input_text"],
+                    # padding=True,
+                    truncation=True,
+                    return_tensors='pt',
+                    max_length=max_length
+                )
+                
+                input_ids["input_ids"] = input_ids["input_ids"].to("cuda")
+                input_ids["attention_mask"] = input_ids["attention_mask"].to("cuda")
+                llm_outputs = model(input_ids)
                 
                 batch_loss = llm_outputs.loss.item()
                 total_loss += batch_loss

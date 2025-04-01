@@ -47,25 +47,15 @@ class MambaCompressor(nn.Module):
 
         self.llm_model = llm_model
         self.llm_toekenizer = llm_tokenizer
-
-        self.llm_model.to("cuda")
-        self.llm_tokenizer.to("cuda")
+        
+        # if self.
+        # self.llm_model.to("cuda")
+        # self.llm_tokenizer.to("cuda")
 
         self.system_prompt = "You are a helpful assistant. Please help to reconstruct the original chat history from this compressed history embedding: "
         self.end_sym = "\n"
     
-    def forward(self, input_texts, max_length=512):
-
-        input_ids = self.llm_tokenizer(
-            input_texts,
-            # padding=True,
-            truncation=True,
-            return_tensors='pt',
-            max_length=max_length
-        )
-
-        input_ids["input_ids"] = input_ids["input_ids"].to("cuda")
-
+    def forward(self, input_ids, max_length=512):
         outputs = self.mamba(input_ids["input_ids"]).last_hidden_state
         
         mem_token_mask = input_ids["input_ids"] == self.mem_token_id
@@ -92,16 +82,57 @@ class MambaCompressor(nn.Module):
         memory_features = torch.stack(memory_features)
         if memory_features.dtype != self.memory_projection.weight.dtype:
             memory_features = memory_features.to(dtype=self.memory_projection.weight.dtype)
-        outputs = self.memory_projection(memory_features)
+        memory_features = self.memory_projection(memory_features)
         
-        inputs = self._prepare_inputs_for_llm(input_ids, outputs, memory_features.size(0), max_length)
-        if not isinstance(inputs, dict):
-            return inputs
+        if self.llm_model is None or self.llm_tokenizer is None:
+            return memory_features
+            
+        atts_memory = torch.ones(
+            (memory_features.size(0), memory_features.size(1)),
+            dtype=torch.long,
+        )
         
+        system_encodings = self.llm_tokenizer(
+            [self.system_prompt] * memory_features.size(0),
+            padding=True,
+            truncation=True,
+            return_tensors='pt',
+            max_length=16
+        )
+
+        # print(f"device system encodings: {system_encodings['input_ids'].device}")
+        # print(f"llm model device: {self.llm_model.parameters().__next__().device}")
+
+        try:
+            system_encodings = system_encodings.to(self.llm_model.parameters().__next__().device)
+        except:
+            pass
+
+        system_embeds = self.llm_model.get_input_embeddings()(system_encodings['input_ids']) # (batch, seq, hidden)
+
+        print(f"system embeds: {system_embeds.shape}")
+        print(f"memory features: {memory_features.shape}")
+        memory_features = torch.cat([system_embeds, memory_features], dim=1)
+        atts_memory = atts_memory[:, :1].expand(-1, memory_features.size(1))
+
+        # Prepare target texts
+        targets = to_regress_tokens.input_ids.masked_fill(
+                    to_regress_tokens.input_ids == self.llm_tokenizer.pad_token_id, -100
+                )
+        empty_targets = (
+                    torch.ones([memory_features.shape[0], memory_features.shape[1]],
+                            dtype=torch.long).fill_(-100)
+                )
+        targets = torch.cat([empty_targets, targets], dim=1)
+        to_regress_embeds = self.llm_model.get_input_embeddings()(to_regress_tokens.input_ids)
+
+        input_embeds = torch.cat([memory_features, to_regress_embeds], dim=1)
+        attention_mask = torch.cat([atts_memory, to_regress_tokens.attention_mask], dim=1)
+
         llm_outputs = self.llm_model(
-            inputs_embeds=inputs['input_embeds'],
-            attention_mask=inputs['attention_mask'],
-            labels=inputs['labels'],
+            inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
+            labels=targets,
             return_dict=True,
         )
         
