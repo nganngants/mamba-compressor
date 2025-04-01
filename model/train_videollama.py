@@ -204,7 +204,7 @@ def main():
 
     # model = model.half()
 
-    model.llm_model = llm.to("cuda")
+    model.llm_model = llm.to("cuda").to(dtype=torch.float16)
     model.llm_tokenizer = tokenizer
 
     model_engine, optimizer, _, _ = deepspeed.initialize(

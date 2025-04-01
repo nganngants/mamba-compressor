@@ -13,6 +13,8 @@ from transformers import (
     AutoTokenizer
 )
 
+from copy import deepcopy
+
 import logging
 logger = logging.getLogger(__name__)
 
@@ -90,7 +92,7 @@ class MambaCompressor(nn.Module):
         atts_memory = torch.ones(
             (memory_features.size(0), memory_features.size(1)),
             dtype=torch.long,
-        )
+        ).to(memory_features.device)
         
         system_encodings = self.llm_tokenizer(
             [self.system_prompt] * memory_features.size(0),
@@ -116,19 +118,24 @@ class MambaCompressor(nn.Module):
         atts_memory = atts_memory[:, :1].expand(-1, memory_features.size(1))
 
         # Prepare target texts
+        to_regress_tokens = deepcopy(input_ids)
         targets = to_regress_tokens.input_ids.masked_fill(
                     to_regress_tokens.input_ids == self.llm_tokenizer.pad_token_id, -100
                 )
         empty_targets = (
                     torch.ones([memory_features.shape[0], memory_features.shape[1]],
                             dtype=torch.long).fill_(-100)
-                )
+                ).to(targets.device)
         targets = torch.cat([empty_targets, targets], dim=1)
+        print(f"targets: {targets.device}")
         to_regress_embeds = self.llm_model.get_input_embeddings()(to_regress_tokens.input_ids)
 
         input_embeds = torch.cat([memory_features, to_regress_embeds], dim=1)
         attention_mask = torch.cat([atts_memory, to_regress_tokens.attention_mask], dim=1)
 
+        print(input_embeds.dtype)
+        for name, param in self.llm_model.named_parameters():
+            print(f"Parameter {name}: {param.dtype}")
         llm_outputs = self.llm_model(
             inputs_embeds=input_embeds,
             attention_mask=attention_mask,
@@ -137,46 +144,6 @@ class MambaCompressor(nn.Module):
         )
         
         return llm_outputs
-    
-    def _prepare_inputs_for_llm(self, to_regress_tokens, memory_features, batch_size, max_length):
-        if self.llm_model is None or self.llm_tokenizer is None:
-            return memory_features
-    
-        atts_memory = torch.ones(
-            (memory_features.size(0), memory_features.size(1)),
-            dtype=torch.long,
-        )
-
-        system_encodings = self.llm_tokenizer(
-            [self.system_prompt] * batch_size,
-            padding=True,
-            truncation=True,
-            return_tensors='pt',
-            max_length=16
-        )
-        system_embeds = self.llm_model.get_input_embeddings()(system_encodings['input_ids']) # (batch, seq, hidden)
-
-        memory_features = torch.cat([system_embeds, memory_features], dim=1)
-        atts_memory = atts_memory[:, :1].expand(-1, memory_features.size(1))
-
-        # Prepare target texts
-        targets = to_regress_tokens.input_ids.masked_fill(
-                    to_regress_tokens.input_ids == self.llm_tokenizer.pad_token_id, -100
-                )
-        empty_targets = (
-                    torch.ones([memory_features.shape[0], memory_features.shape[1]],
-                            dtype=torch.long).fill_(-100)
-                )
-        targets = torch.cat([empty_targets, targets], dim=1)
-        to_regress_embeds = self.llm_model.get_input_embeddings()(to_regress_tokens.input_ids)
-
-        input_embeds = torch.cat([memory_features, to_regress_embeds], dim=1)
-        attention_mask = torch.cat([atts_memory, to_regress_tokens.attention_mask], dim=1)
-        return  {
-            'input_embeds': input_embeds,
-            'attention_mask': attention_mask,
-            'labels': targets,
-        }
 
     def save_pretrained(self, path: str):
         os.makedirs(path, exist_ok=True)

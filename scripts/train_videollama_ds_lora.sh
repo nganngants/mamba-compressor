@@ -4,8 +4,8 @@ deepspeed --num_gpus=1 \
     model/train_videollama.py \
     --deepspeed ds_config.json \
     --mamba_path "state-spaces/mamba-370m-hf" \
-    --train_data "jsonl_TrainTesTval_noVidDesc_latest/train.jsonl" \
-    --valid_data "jsonl_TrainTesTval_noVidDesc_latest/val.jsonl" \
+    --train_data "jsonl_TrainValMerge_noVidDesc_max_emotion_last_strategy/train.jsonl" \
+    --valid_data "jsonl_TrainValMerge_noVidDesc_max_emotion_last_strategy/val.jsonl" \
     --model_dir "./mamba_compressor_log" \
     --llm_name "DAMO-NLP-SG/VideoLLaMA2.1-7B-AV" \
     --batch_size_single 1 \
