@@ -8,7 +8,8 @@ deepspeed --num_gpus=1 \
     --valid_data "jsonl_TrainValMerge_noVidDesc_max_emotion_last_strategy/val.jsonl" \
     --model_dir "./mamba_compressor_log" \
     --llm_name "Qwen/Qwen2.5-7B-Instruct" \
-    --batch_size_single 1 \
+    --max_length 1024 \
+    --batch_size_single 4 \
     --batch_size_conv 1 \
     --epochs_single 3 \
     --epochs_conv 1 \

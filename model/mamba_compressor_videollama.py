@@ -57,7 +57,7 @@ class MambaCompressor(nn.Module):
         self.system_prompt = "You are a helpful assistant. Please help to reconstruct the original chat history from this compressed history embedding: "
         self.end_sym = "\n"
     
-    def forward(self, input_ids, max_length=512):
+    def forward(self, input_ids, max_length=1024):
         outputs = self.mamba(input_ids["input_ids"]).last_hidden_state
         
         mem_token_mask = input_ids["input_ids"] == self.mem_token_id
