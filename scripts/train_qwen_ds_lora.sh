@@ -17,7 +17,7 @@ deepspeed --num_gpus=2 \
     --lr_conv 1e-4 \
     --eval_steps 100 \
     --patience_steps 2 \
-    --gradient_accumulation_steps 1 \
+    --gradient_accumulation_steps 16 \
     --scheduler_type reduce_on_plateau \
-    --lora_r 4 \
-    --lora_alpha 8 
+    --lora_r 64 \
+    --lora_alpha 128 

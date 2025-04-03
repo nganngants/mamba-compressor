@@ -1,5 +1,6 @@
 # run following after conda activate
 
+source ~/.bashrc
 pip uninstall bitsandbytes -y
 pip install --upgrade bitsandbytes
 pip install deepspeed
@@ -14,12 +15,12 @@ git config --global user.email "nganngants@gmail.com"
 git config --global user.name "nganngants"
 
 gdown --folder https://drive.google.com/drive/folders/1-8EYXtqvcj9wet80WNuAjYW-E9p5--7Q?usp=drive_link
-# gdown 17nHhoVx8im-fjsY7cqFL2OrMwVusHMHJ
-
-# unzip mamba_ckpt.zip
 
 git submodule update --init
 cd VideoLLaMA2
 git checkout audio_visual
 pip install -e .
 cd ..
+# gdown 17nHhoVx8im-fjsY7cqFL2OrMwVusHMHJ
+
+# unzip mamba_ckpt.zip
